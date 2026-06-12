@@ -1,0 +1,16 @@
+name: dp-pusht-py312
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - torchvision
+  - pip
+  - ffmpeg
+  # Adjust this pair if your CUDA/driver is different.
+  - pytorch>=2.4
+  - pytorch-cuda=12.1
+  - torchvision
+  - pip:
+      - -r requirements_py312.txt
