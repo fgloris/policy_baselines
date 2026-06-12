@@ -45,12 +45,14 @@ Diffusion Policy:
 
 ```bash
 python train.py --config-name=train_diffusion_unet_lowdim_workspace training.device=cuda:0
+python train.py --config-name=train_diffusion_unet_image_workspace training.device=cuda:0
 ```
 
 IBC:
 
 ```bash
 python train.py --config-name=train_ibc_dfo_lowdim_workspace training.device=cuda:0
+python train.py --config-name=train_ibc_dfo_image_workspace training.device=cuda:0
 ```
 
 Useful quick smoke-test overrides:

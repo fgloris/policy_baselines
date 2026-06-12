@@ -1,6 +1,20 @@
-# Install PyTorch separately for your CUDA version, then install this file.
-# Example CUDA 12.1:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Windows + Python 3.12 + CUDA 12.4 build.
+# IMPORTANT:
+#   Do NOT run `pip install torchvision` alone, otherwise pip may replace
+#   your CUDA torch with a CPU/default torch wheel.
+#   Install with this file, or use:
+#     pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+setuptools==75.8.0
+
+# PyTorch CUDA 12.4 matched pair
+# torch 2.5.1 <-> torchvision 0.20.1 <-> torchaudio 2.5.1
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+torchaudio==2.5.1+cu124
+
 hydra-core>=1.3.2,<1.4
 omegaconf>=2.3.0,<2.4
 diffusers>=0.30.0,<0.36
@@ -17,13 +31,10 @@ scikit-image>=0.23
 pymunk>=6.8
 pygame>=2.6
 shapely>=2.0
-gym==0.26.2
+gymnasium
 wandb>=0.17
 tqdm>=4.66
 dill>=0.3.8
 av>=12.0
 matplotlib>=3.8
-
-torchvision
-
 robomimic
