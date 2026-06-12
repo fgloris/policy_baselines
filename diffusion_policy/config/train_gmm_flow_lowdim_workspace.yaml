@@ -1,0 +1,154 @@
+defaults:
+  - _self_
+  - task: pusht_lowdim
+
+name: train_gmm_flow_lowdim
+_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
+
+obs_dim: ${task.obs_dim}
+action_dim: ${task.action_dim}
+keypoint_dim: ${task.keypoint_dim}
+task_name: ${task.name}
+exp_name: "gmm_flow"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+past_action_visible: False
+keypoint_visible_rate: 1.0
+
+# gmm_flow directly predicts the executable action chunk.
+# This is intentionally different from the previous pure FM config, which is left unchanged.
+pred_action_steps_only: True
+class_embed_dim: 32
+num_classes: 16
+
+policy:
+  _target_: diffusion_policy.policy.gmm_flow_lowdim_policy.GMMFlowLowdimPolicy
+
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    input_dim: ${task.action_dim}
+    global_cond_dim: ${eval:${task.obs_dim}*${n_obs_steps}+${class_embed_dim}}
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: True
+
+  # Fit this file first with scripts/fit_gmm_flow_gmm.py.
+  # It must be fitted on normalized action chunks with the same n_obs_steps/n_action_steps.
+  gmm_path: data/gmm/pusht/action_gmm_K16_diag.npz
+
+  horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_classes: ${num_classes}
+  class_embed_dim: ${class_embed_dim}
+
+  classifier_hidden_dims: [512, 512]
+  classifier_activation: mish
+  classifier_dropout: 0.0
+
+  # Flow inference / ODE settings. Kept at 20 so your original FM setting is not changed.
+  num_inference_steps: 20
+  inference_mode: midpoint_euler
+  time_scale: 100.0
+  t_min: 0.0
+  t_max: 1.0
+
+  # Source distribution x0 ~ selected GMM component in normalized action-chunk space.
+  source_noise_scale: 1.0
+  source_std_min: 0.03
+  source_std_max: 0.5
+  covariance_jitter: 1.0e-6
+  source_sample_mode: sample   # sample | mean
+
+  # Training uses GT GMM label. Inference uses classifier prediction.
+  inference_class_mode: argmax # argmax | sample
+  class_temperature: 1.0
+
+  oa_step_convention: True
+  ce_weight: 1.0
+  flow_weight: 1.0
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 256
+  num_workers: 1
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 1
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 501
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 25
+  sample_every: 25
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
