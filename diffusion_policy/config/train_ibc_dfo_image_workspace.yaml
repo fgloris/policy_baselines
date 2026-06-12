@@ -64,7 +64,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 500
+  num_epochs: 501
   gradient_accumulate_every: 1
   # training loop control
   # in epochs
