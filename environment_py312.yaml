@@ -1,4 +1,4 @@
-name: dp-pusht-py312
+name: pusht
 channels:
   - conda-forge
 dependencies:

@@ -3,7 +3,7 @@ import numpy as np
 import skimage.transform as st
 import pymunk
 import pygame
-from matplotlib import cm
+import matplotlib
 import cv2
 from diffusion_policy.env.pusht.pymunk_override import DrawOptions
 
@@ -34,7 +34,7 @@ class PymunkKeypointManager:
             "<attribute_name>": (N,2) floats in object local coordinate
         """
         if color_map is None:
-            cmap = cm.get_cmap('tab10')
+            cmap = matplotlib.colormaps['tab10']
             color_map = dict()
             for i, key in enumerate(local_keypoint_map.keys()):
                 color_map[key] = (np.array(cmap.colors[i]) * 255).astype(np.uint8)
