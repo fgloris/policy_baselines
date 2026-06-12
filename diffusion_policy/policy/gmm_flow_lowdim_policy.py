@@ -415,8 +415,8 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
         with torch.no_grad():
             self.last_loss_info = {
                 "loss": float(loss.detach().cpu()),
-                "flow_loss": float(flow_loss.detach().cpu()),
-                "ce_loss": float(ce_loss.detach().cpu()),
+                "flow_matching_loss": float(flow_loss.detach().cpu()),
+                "cls_loss": float(ce_loss.detach().cpu()),
                 "class_acc": float((logits.argmax(dim=-1) == labels).float().mean().detach().cpu()),
             }
         return loss

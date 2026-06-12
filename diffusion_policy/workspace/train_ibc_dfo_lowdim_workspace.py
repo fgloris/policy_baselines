@@ -22,17 +22,18 @@ import shutil
 
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-from diffusion_policy.policy.ibc_dfo_lowdim_policy import IbcDfoLowdimPolicy
+from diffusion_policy.policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
 from diffusion_policy.dataset.base_dataset import BaseLowdimDataset
 from diffusion_policy.env_runner.base_lowdim_runner import BaseLowdimRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusers.training_utils import EMAModel
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 # %%
-class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
+class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -45,8 +46,12 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
         random.seed(seed)
 
         # configure model
-        self.model: IbcDfoLowdimPolicy
+        self.model: DiffusionUnetLowdimPolicy
         self.model = hydra.utils.instantiate(cfg.policy)
+
+        self.ema_model: DiffusionUnetLowdimPolicy = None
+        if cfg.training.use_ema:
+            self.ema_model = copy.deepcopy(self.model)
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
@@ -77,6 +82,8 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
+        if cfg.training.use_ema:
+            self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
         lr_scheduler = get_scheduler(
@@ -90,6 +97,13 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step-1
         )
+
+        # configure ema
+        ema: EMAModel = None
+        if cfg.training.use_ema:
+            ema = hydra.utils.instantiate(
+                cfg.ema,
+                model=self.ema_model)
 
         # configure env runner
         env_runner: BaseLowdimRunner
@@ -119,6 +133,8 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
         # device transfer
         device = torch.device(cfg.training.device)
         self.model.to(device)
+        if self.ema_model is not None:
+            self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
 
         # save batch for sampling
@@ -140,6 +156,7 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()
+                train_loss_infos = dict()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
@@ -158,10 +175,13 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
+                        
+                        # update ema
+                        if cfg.training.use_ema:
+                            ema.step(self.model)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
                         step_log = {
                             'train_loss': raw_loss_cpu,
@@ -169,6 +189,29 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+
+                        # Some custom policies, e.g. gmm_flow, expose component losses
+                        # through self.model.last_loss_info after compute_loss().
+                        # This keeps the original workspace compatible with ordinary
+                        # diffusion/IBC policies while logging train_cls_loss and
+                        # train_flow_matching_loss when available.
+                        loss_info = getattr(self.model, 'last_loss_info', None)
+                        postfix = {'loss': raw_loss_cpu}
+                        if isinstance(loss_info, dict):
+                            for key, value in loss_info.items():
+                                if key == 'loss':
+                                    continue
+                                log_key = f'train_{key}'
+                                value = float(value)
+                                step_log[log_key] = value
+                                train_loss_infos.setdefault(log_key, list()).append(value)
+                                if key == 'cls_loss':
+                                    postfix['cls'] = value
+                                elif key == 'flow_matching_loss':
+                                    postfix['fm'] = value
+                                elif key == 'class_acc':
+                                    postfix['acc'] = value
+                        tepoch.set_postfix(**postfix, refresh=False)
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -185,9 +228,14 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                 # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
                 step_log['train_loss'] = train_loss
+                for key, values in train_loss_infos.items():
+                    if len(values) > 0:
+                        step_log[key] = float(np.mean(values))
 
                 # ========= eval for this epoch ==========
                 policy = self.model
+                if cfg.training.use_ema:
+                    policy = self.ema_model
                 policy.eval()
 
                 # run rollout
@@ -200,12 +248,21 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
+                        val_loss_infos = dict()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
+
+                                loss_info = getattr(self.model, 'last_loss_info', None)
+                                if isinstance(loss_info, dict):
+                                    for key, value in loss_info.items():
+                                        if key == 'loss':
+                                            continue
+                                        val_loss_infos.setdefault(f'val_{key}', list()).append(float(value))
+
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -213,21 +270,26 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            for key, values in val_loss_infos.items():
+                                if len(values) > 0:
+                                    step_log[key] = float(np.mean(values))
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = train_sampling_batch
-                        n_samples = cfg.training.sample_max_batch
-                        obs_dict = {'obs': batch['obs'][:n_samples]}
-                        gt_action = batch['action'][:n_samples]
-
+                        obs_dict = {'obs': batch['obs']}
+                        gt_action = batch['action']
+                        
                         result = policy.predict_action(obs_dict)
-                        pred_action = result['action']
-                        start = cfg.n_obs_steps - 1
-                        end = start + cfg.n_action_steps
-                        gt_action = gt_action[:,start:end]
+                        if cfg.pred_action_steps_only:
+                            pred_action = result['action']
+                            start = cfg.n_obs_steps - 1
+                            end = start + cfg.n_action_steps
+                            gt_action = gt_action[:,start:end]
+                        else:
+                            pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         # log
                         step_log['train_action_mse_error'] = mse.item()
@@ -275,7 +337,7 @@ class TrainIbcDfoLowdimWorkspace(BaseWorkspace):
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainIbcDfoLowdimWorkspace(cfg)
+    workspace = TrainDiffusionUnetLowdimWorkspace(cfg)
     workspace.run()
 
 if __name__ == "__main__":
