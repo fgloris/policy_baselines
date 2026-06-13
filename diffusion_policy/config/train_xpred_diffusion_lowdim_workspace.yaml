@@ -47,7 +47,7 @@ policy:
 
   # JiT-style x-prediction settings.
   # Network output is clean normalized action trajectory x_pred.
-  num_inference_steps: 50
+  num_inference_steps: 60
   source_noise_std: 1.0
   time_embed_scale: 100.0
   t_min: 1.0e-4

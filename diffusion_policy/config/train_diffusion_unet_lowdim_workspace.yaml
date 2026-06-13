@@ -43,6 +43,7 @@ policy:
     beta_schedule: squaredcos_cap_v2
     variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
     clip_sample: True # required when predict_epsilon=False
+    # prediction_type: "sample" for JiT setting
     prediction_type: epsilon # or sample
 
   horizon: ${horizon}

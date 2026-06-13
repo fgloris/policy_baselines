@@ -2,14 +2,14 @@ defaults:
   - _self_
   - task: pusht_lowdim
 
-name: train_ddpm_xpred_unet_lowdim
-_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
+name: train_direction_mag_mlp_lowdim
+_target_: diffusion_policy.workspace.train_direction_mag_mlp_lowdim_workspace.TrainDirectionMagMLPLowdimWorkspace
 
 obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
 keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-exp_name: "ddpm_xpred"
+exp_name: "dir32_mag_mlp512"
 
 horizon: 16
 n_obs_steps: 2
@@ -17,47 +17,36 @@ n_action_steps: 8
 n_latency_steps: 0
 past_action_visible: False
 keypoint_visible_rate: 1.0
-obs_as_local_cond: False
-obs_as_global_cond: True
-pred_action_steps_only: False
+pred_action_steps_only: True
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
-
-  model:
-    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
-    input_dim: "${eval: ${task.action_dim} if ${obs_as_local_cond} or ${obs_as_global_cond} else ${task.obs_dim} + ${task.action_dim}}"
-    local_cond_dim: "${eval: ${task.obs_dim} if ${obs_as_local_cond} else None}"
-    global_cond_dim: "${eval: ${task.obs_dim}*${n_obs_steps} if ${obs_as_global_cond} else None}"
-    diffusion_step_embed_dim: 256
-    down_dims: [256, 512, 1024]
-    kernel_size: 5
-    n_groups: 8
-    cond_predict_scale: True
-  
-  noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
-    num_train_timesteps: 100
-    beta_start: 0.0001
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
-    clip_sample: True # required when predict_epsilon=False
-    prediction_type: sample # x-prediction: predict clean trajectory x_0
+  _target_: diffusion_policy.policy.direction_mag_mlp_lowdim_policy.DirectionMagMLPLowdimPolicy
 
   horizon: ${horizon}
   obs_dim: ${obs_dim}
   action_dim: ${action_dim}
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
-  num_inference_steps: 100
-  obs_as_local_cond: ${obs_as_local_cond}
-  obs_as_global_cond: ${obs_as_global_cond}
-  pred_action_steps_only: ${pred_action_steps_only}
-  oa_step_convention: True
 
-  # scheduler.step params
-  # predict_epsilon: True
+  # 512-MLP baseline
+  num_dir_bins: 32
+  hidden_dim: 512
+  depth: 4
+  activation: mish
+  layer_norm: True
+
+  # Loss = CE + log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
+  # All losses are computed in normalized action coordinates.
+  dir_loss_weight: 1.0
+  mag_loss_weight: 1.0
+  traj_loss_weight: 0.5
+
+  # Ignore direction labels when normalized step length is too small.
+  dir_eps: 1.0e-2
+  # log target is log(1 + ||delta|| / mag_scale) in normalized action space.
+  mag_scale: 5.0e-2
+  mag_head_init_bias: -2.0
+  oa_step_convention: True
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -83,7 +72,7 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 3.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -93,22 +82,17 @@ training:
   seed: 42
   debug: False
   resume: True
-  # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 2000
+  num_epochs: 5000
   gradient_accumulate_every: 1
   use_ema: True
-  # training loop control
-  # in epochs
   rollout_every: 50
   checkpoint_every: 50
   val_every: 1
   sample_every: 5
-  # steps per epoch
   max_train_steps: null
   max_val_steps: null
-  # misc
   tqdm_interval_sec: 1.0
 
 logging:
