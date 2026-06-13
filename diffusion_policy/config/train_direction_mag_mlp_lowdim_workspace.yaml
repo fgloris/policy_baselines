@@ -14,7 +14,7 @@ exp_name: "mlp"
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 1
-pred_action_steps: 8
+pred_action_steps: 4
 n_latency_steps: 0
 past_action_visible: False
 keypoint_visible_rate: 1.0
@@ -57,10 +57,10 @@ policy:
   mag_all_reg_weight: 5.0e-2
   # Circular Gaussian sigma measured in direction-bin widths. With 32 bins,
   # one bin is 11.25 degrees; sigma=1.0 mainly trains the nearest few experts.
-  gaussian_sigma_bins: 1.0
+  gaussian_sigma_bins: 0.8
   # tanh(raw_bias) is multiplied by bias_range_bins * bin_width.
   # 1.0 lets adjacent experts correct by one full bin width.
-  bias_range_bins: 1.0
+  bias_range_bins: 0.8
 
   # Ignore direction/bias labels when normalized step length is too small.
   dir_eps: 1.0e-2
