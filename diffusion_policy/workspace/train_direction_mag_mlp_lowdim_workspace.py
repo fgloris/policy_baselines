@@ -188,6 +188,7 @@ class TrainDirectionMagMLPLowdimWorkspace(BaseWorkspace):
                             postfix.update(
                                 dir=loss_log["train_loss_dir_loss"],
                                 mag=loss_log["train_loss_mag_loss"],
+                                bias=loss_log.get("train_loss_bias_loss", 0.0),
                                 traj=loss_log["train_loss_traj_loss"],
                             )
                         tepoch.set_postfix(**postfix, refresh=False)

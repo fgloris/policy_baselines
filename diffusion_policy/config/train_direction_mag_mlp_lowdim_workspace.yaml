@@ -9,7 +9,7 @@ obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
 keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-exp_name: "dir_perbin_mag_mlp512_reg_pred8_exec1"
+exp_name: "mlp"
 
 horizon: 16
 n_obs_steps: 2
@@ -38,27 +38,31 @@ policy:
   n_obs_steps: ${n_obs_steps}
 
   # 512-MLP baseline
-  num_dir_bins: 64
+  num_dir_bins: 32
   hidden_dim: 512
   depth: 4
   activation: relu
   layer_norm: True
-  dropout: 0.08
+  dropout: 0.15
 
-  # Loss = CE + per-direction log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
-  # Each direction bin has its own magnitude regression head.
+  # Loss = Gaussian soft CE + Gaussian-weighted per-bin magnitude/bias regression
+  #      + (1 - Gaussian weight) magnitude regularization + vector reconstruction.
+  # Each predicted step has 32 experts: direction logit + magnitude + direction bias.
   # All losses are computed in normalized action coordinates.
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
-  traj_loss_weight: 1.0
-  # Small regularizer for all per-direction magnitude experts.
-  # Important because every sample supervises only one of the 64 mag heads.
-  mag_all_reg_weight: 1.0e-3
-  # Circular soft labels for direction CE. Target bin gets 0.8, k-1 and k+1 get 0.1 each.
-  # Set to 0.0 to recover hard CE.
-  dir_neighbor_smoothing: 0.1
+  bias_loss_weight: 0.3
+  traj_loss_weight: 0.1
+  # Regularize far-away experts with (1 - peak-normalized Gaussian weight).
+  mag_all_reg_weight: 5.0e-2
+  # Circular Gaussian sigma measured in direction-bin widths. With 32 bins,
+  # one bin is 11.25 degrees; sigma=1.0 mainly trains the nearest few experts.
+  gaussian_sigma_bins: 1.0
+  # tanh(raw_bias) is multiplied by bias_range_bins * bin_width.
+  # 1.0 lets adjacent experts correct by one full bin width.
+  bias_range_bins: 1.0
 
-  # Ignore direction labels when normalized step length is too small.
+  # Ignore direction/bias labels when normalized step length is too small.
   dir_eps: 1.0e-2
   # log target is log(1 + ||delta|| / mag_scale) in normalized action space.
   # The network predicts this value separately for each direction bin.
@@ -99,7 +103,7 @@ training:
   device: "cuda:0"
   seed: 42
   debug: False
-  resume: True
+  resume: False
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 20000
@@ -115,7 +119,7 @@ training:
 
 logging:
   project: diffusion_policy_debug
-  resume: True
+  resume: False
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
   tags: ["${name}", "${task_name}", "${exp_name}"]

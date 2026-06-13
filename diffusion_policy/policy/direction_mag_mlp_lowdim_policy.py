@@ -13,14 +13,23 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
     """
     MLP baseline for Push-T lowdim.
 
-    The policy predicts an action chunk as a small mixture-of-experts in
-    normalized action space:
-      - direction: categorical bin per predicted action step
-      - magnitude: one continuous non-negative step length for every direction bin
+    The policy predicts an action chunk as 32/64/... circular direction experts
+    in normalized action space. For every predicted action step and every
+    direction bin it outputs:
+      - a direction logit
+      - a non-negative magnitude
+      - a bounded angular bias around that bin center
 
-    In other words, each predicted step has 64 (direction + regression) experts
-    when num_dir_bins=64. At inference time, the argmax direction selects its
-    own magnitude head instead of sharing one global magnitude regression head.
+    Inference selects the direction with argmax(logit), then reconstructs the
+    continuous delta with:
+        theta = bin_center[k] + bias[k]
+        delta = magnitude[k] * [cos(theta), sin(theta)]
+
+    Training uses a circular Gaussian centered at the continuous GT angle:
+      - direction CE uses the Gaussian normalized to sum=1
+      - magnitude/bias/vector regression uses the Gaussian peak-normalized to 1
+      - magnitude regularization uses (1 - weight) so far-away experts do not
+        drift to large arbitrary actions
 
     The first delta is from the current agent position to the first action;
     later deltas are between consecutive action targets. Current agent position
@@ -44,17 +53,21 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         dropout: float = 0.0,
         dir_loss_weight: float = 1.0,
         mag_loss_weight: float = 1.0,
-        traj_loss_weight: float = 0.5,
-        mag_all_reg_weight: float = 0.0,
-        dir_neighbor_smoothing: float = 0.10,
+        bias_loss_weight: float = 0.3,
+        traj_loss_weight: float = 0.1,
+        mag_all_reg_weight: float = 5.0e-2,
+        gaussian_sigma_bins: float = 1.0,
+        bias_range_bins: float = 1.0,
         dir_eps: float = 1.0e-2,
         mag_scale: float = 5.0e-2,
         mag_head_init_bias: float = -2.0,
         oa_step_convention: bool = True,
+        # Deprecated; kept so older hydra overrides do not crash.
+        dir_neighbor_smoothing: float = None,
         **kwargs,
     ):
         super().__init__()
-        assert action_dim == 2, "Direction/magnitude baseline currently assumes 2D actions."
+        assert action_dim == 2, "Direction/magnitude/bias baseline currently assumes 2D actions."
         assert num_dir_bins > 1
         assert n_action_steps >= 1
         if pred_action_steps is None:
@@ -64,9 +77,8 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         assert hidden_dim > 0
         assert 0.0 <= dropout < 1.0
         assert mag_all_reg_weight >= 0.0
-        assert 0.0 <= dir_neighbor_smoothing < 0.5
-        if dir_neighbor_smoothing > 0.0:
-            assert num_dir_bins > 2, "Neighbor smoothing needs at least 3 direction bins."
+        assert gaussian_sigma_bins > 0.0
+        assert bias_range_bins > 0.0
 
         self.horizon = horizon
         self.obs_dim = obs_dim
@@ -80,9 +92,11 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         self.dropout = dropout
         self.dir_loss_weight = dir_loss_weight
         self.mag_loss_weight = mag_loss_weight
+        self.bias_loss_weight = bias_loss_weight
         self.traj_loss_weight = traj_loss_weight
         self.mag_all_reg_weight = mag_all_reg_weight
-        self.dir_neighbor_smoothing = dir_neighbor_smoothing
+        self.gaussian_sigma_bins = gaussian_sigma_bins
+        self.bias_range_bins = bias_range_bins
         self.dir_eps = dir_eps
         self.mag_scale = mag_scale
         self.oa_step_convention = oa_step_convention
@@ -111,28 +125,45 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
                 layers.append(nn.Dropout(dropout))
             dim = hidden_dim
         self.trunk = nn.Sequential(*layers)
+
         self.dir_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
-        # Per-direction magnitude experts: [T, K] instead of one shared [T] regressor.
         self.mag_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
+        self.bias_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
 
-        # Start with small positive magnitudes instead of large random moves.
+        # Start with small positive magnitudes and near-zero angular correction.
         nn.init.constant_(self.mag_head.bias, mag_head_init_bias)
+        nn.init.zeros_(self.bias_head.bias)
 
-        unit_dirs = self._build_unit_dirs(num_dir_bins)
+        angle_centers = self._build_angle_centers(num_dir_bins)
+        unit_dirs = torch.stack([torch.cos(angle_centers), torch.sin(angle_centers)], dim=-1)
+        self.register_buffer("angle_centers", angle_centers, persistent=False)
         self.register_buffer("unit_dirs", unit_dirs, persistent=False)
         self.last_loss_info = dict()
 
     @staticmethod
-    def _build_unit_dirs(num_bins: int) -> torch.Tensor:
+    def _build_angle_centers(num_bins: int) -> torch.Tensor:
         # Bin centers from [-pi, pi). Class 0 is centered at -pi + half_bin.
         half_bin = math.pi / num_bins
-        angles = torch.linspace(
+        return torch.linspace(
             -math.pi + half_bin,
             math.pi - half_bin,
             num_bins,
             dtype=torch.float32,
         )
-        return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+
+    @staticmethod
+    def _angle_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Circular signed angle difference a - b, returned in [-pi, pi]."""
+        return torch.atan2(torch.sin(a - b), torch.cos(a - b))
+
+    @property
+    def bin_width(self) -> float:
+        return 2.0 * math.pi / self.num_dir_bins
+
+    @property
+    def bias_angle_range(self) -> float:
+        # bias_norm in [-1, 1] is mapped to +/- this many radians.
+        return self.bias_range_bins * self.bin_width
 
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
@@ -151,16 +182,22 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         raw_agent_pos = raw_obs[:, self.n_obs_steps - 1, -2:]
         return self.normalizer["action"].normalize(raw_agent_pos)
 
-    def _forward_heads(self, nobs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _forward_heads(self, nobs: torch.Tensor):
         h = self.trunk(self._obs_cond(nobs))
         B = nobs.shape[0]
         dir_logits = self.dir_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
-        # Predict log(1 + r / mag_scale) for every direction bin. Shape: [B, T, K].
+
+        # Predict log(1 + r / mag_scale) for every direction bin.
         pred_log_mag = F.softplus(
             self.mag_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
         )
         pred_mag = self.mag_scale * torch.expm1(pred_log_mag).clamp_min(0.0)
-        return dir_logits, pred_log_mag, pred_mag
+
+        # Bounded angular correction around each direction center.
+        raw_bias = self.bias_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
+        pred_bias_norm = torch.tanh(raw_bias)
+        pred_bias_angle = pred_bias_norm * self.bias_angle_range
+        return dir_logits, pred_log_mag, pred_mag, pred_bias_norm, pred_bias_angle
 
     @staticmethod
     def _gather_by_dir(values: torch.Tensor, dir_idx: torch.Tensor) -> torch.Tensor:
@@ -172,43 +209,32 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         prev = torch.cat([n_agent_pos[:, None, :], naction_target[:, :-1, :]], dim=1)
         return naction_target - prev
 
-    def _delta_to_dir_mag(self, ndelta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _delta_to_angle_mag(self, ndelta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mag = torch.linalg.norm(ndelta, dim=-1)
         theta = torch.atan2(ndelta[..., 1], ndelta[..., 0])
-        # Map theta in [-pi, pi] to class in [0, K-1].
-        cls = torch.floor((theta + math.pi) / (2.0 * math.pi) * self.num_dir_bins).long()
-        cls = torch.clamp(cls, min=0, max=self.num_dir_bins - 1)
-        return cls, mag
+        return theta, mag
+
+    def _nearest_dir_idx(self, theta: torch.Tensor) -> torch.Tensor:
+        centers = self.angle_centers.to(device=theta.device, dtype=theta.dtype)
+        diff = self._angle_diff(theta.unsqueeze(-1), centers)
+        return diff.abs().argmin(dim=-1)
+
+    def _gaussian_dir_weights(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return peak-normalized circular Gaussian weights and signed deltas.
+
+        theta: [B, T]
+        weights: [B, T, K], max over K is exactly 1 for every sample.
+        delta: [B, T, K], signed theta - center[k] in radians.
+        """
+        centers = self.angle_centers.to(device=theta.device, dtype=theta.dtype)
+        delta = self._angle_diff(theta.unsqueeze(-1), centers)
+        sigma = self.gaussian_sigma_bins * self.bin_width
+        weights = torch.exp(-0.5 * (delta / sigma).square())
+        weights = weights / weights.amax(dim=-1, keepdim=True).clamp_min(1.0e-12)
+        return weights, delta
 
     def _cumsum_actions(self, ndelta: torch.Tensor, n_agent_pos: torch.Tensor) -> torch.Tensor:
         return n_agent_pos[:, None, :] + torch.cumsum(ndelta, dim=1)
-
-    def _circular_neighbor_ce(self, dir_logits: torch.Tensor, dir_target: torch.Tensor) -> torch.Tensor:
-        """Per-step CE with circular soft labels.
-
-        The target bin keeps most mass, while its immediate circular neighbors
-        k-1 and k+1 receive a small mass. This prevents adjacent directions
-        from being penalized as harshly as completely opposite directions.
-        Returns [B, T] unreduced loss.
-        """
-        eps = self.dir_neighbor_smoothing
-        if eps <= 0.0:
-            return F.cross_entropy(
-                dir_logits.reshape(-1, self.num_dir_bins),
-                dir_target.reshape(-1),
-                reduction="none",
-            ).reshape(dir_target.shape)
-
-        log_probs = F.log_softmax(dir_logits, dim=-1)
-        soft_target = torch.zeros_like(log_probs)
-        center_prob = 1.0 - 2.0 * eps
-        left_target = (dir_target - 1) % self.num_dir_bins
-        right_target = (dir_target + 1) % self.num_dir_bins
-
-        soft_target.scatter_(-1, dir_target.unsqueeze(-1), center_prob)
-        soft_target.scatter_(-1, left_target.unsqueeze(-1), eps)
-        soft_target.scatter_(-1, right_target.unsqueeze(-1), eps)
-        return -(soft_target * log_probs).sum(dim=-1)
 
     # ========= inference ==========
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -220,11 +246,16 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         B, _, Do = nobs.shape
         assert Do == self.obs_dim
 
-        dir_logits, pred_log_mag_all, pred_mag_all = self._forward_heads(nobs)
+        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(nobs)
         dir_idx = torch.argmax(dir_logits, dim=-1)
         pred_log_mag = self._gather_by_dir(pred_log_mag_all, dir_idx)
         pred_mag = self._gather_by_dir(pred_mag_all, dir_idx)
-        unit = self.unit_dirs.to(device=dir_logits.device, dtype=dir_logits.dtype)[dir_idx]
+        pred_bias_norm = self._gather_by_dir(pred_bias_norm_all, dir_idx)
+        pred_bias_angle = self._gather_by_dir(pred_bias_angle_all, dir_idx)
+
+        centers = self.angle_centers.to(device=dir_logits.device, dtype=dir_logits.dtype)
+        theta = centers[dir_idx] + pred_bias_angle
+        unit = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
         ndelta = pred_mag[..., None] * unit
 
         n_agent_pos = self._current_agent_pos_action_normalized(raw_obs)
@@ -237,10 +268,15 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "action": action,
             "action_pred": action_pred,
             "dir_logits": dir_logits,
+            "dir_idx": dir_idx,
             "mag_log_pred": pred_log_mag,
             "mag_pred": pred_mag,
             "mag_log_pred_all": pred_log_mag_all,
             "mag_pred_all": pred_mag_all,
+            "bias_norm_pred": pred_bias_norm,
+            "bias_angle_pred": pred_bias_angle,
+            "bias_norm_pred_all": pred_bias_norm_all,
+            "bias_angle_pred_all": pred_bias_angle_all,
         }
 
     # ========= training ==========
@@ -257,40 +293,70 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         n_agent_pos = self._current_agent_pos_action_normalized(raw_obs)
 
         ndelta_gt = self._target_delta(naction_target, n_agent_pos)
-        dir_target, mag_target = self._delta_to_dir_mag(ndelta_gt)
+        theta_target, mag_target = self._delta_to_angle_mag(ndelta_gt)
+        dir_target = self._nearest_dir_idx(theta_target)
         valid_dir = mag_target > self.dir_eps
-
-        dir_logits, pred_log_mag_all, pred_mag_all = self._forward_heads(nobs)
-
-        # 1) Direction classification loss. Ignore near-zero displacement frames.
-        # Use circular soft labels: target bin gets 1-2*s, adjacent bins get s each.
-        # This makes +/-1-bin mistakes much cheaper than far-away direction mistakes.
-        ce = self._circular_neighbor_ce(dir_logits, dir_target)
         valid_float = valid_dir.float()
-        dir_loss = (ce * valid_float).sum() / valid_float.sum().clamp_min(1.0)
 
-        # 2) Magnitude regression loss in log space.
-        # Only the target direction's expert receives the regression target.
+        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(nobs)
+
+        # 1) Direction classification loss: circular Gaussian soft CE.
+        # Classification target is sum-normalized. Regression weights below are
+        # peak-normalized to 1 and are intentionally not probabilities.
+        gauss_w, angle_delta = self._gaussian_dir_weights(theta_target)
+        target_prob = gauss_w / gauss_w.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+        log_prob = F.log_softmax(dir_logits, dim=-1)
+        dir_ce = -(target_prob * log_prob).sum(dim=-1)
+        dir_loss = (dir_ce * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+
+        # 2) Gaussian-weighted magnitude regression in log space.
+        # Near-zero deltas have no reliable direction, so they are handled by the
+        # all-expert magnitude regularizer instead of the directional regression.
         target_log_mag = torch.log1p(mag_target / self.mag_scale)
-        pred_log_mag_gt_dir = self._gather_by_dir(pred_log_mag_all, dir_target)
-        pred_mag_gt_dir = self._gather_by_dir(pred_mag_all, dir_target)
-        mag_loss = F.smooth_l1_loss(pred_log_mag_gt_dir, target_log_mag)
+        mag_loss_all_bins = F.smooth_l1_loss(
+            pred_log_mag_all,
+            target_log_mag.unsqueeze(-1).expand_as(pred_log_mag_all),
+            reduction="none",
+        )
+        reg_w = gauss_w * valid_float.unsqueeze(-1)
+        mag_loss = (reg_w * mag_loss_all_bins).sum() / reg_w.sum().clamp_min(1.0)
 
-        # 3) Tiny magnitude prior for all experts. For each sample only one
-        # direction expert is supervised, so this keeps unused heads from drifting
-        # to large arbitrary values without dominating the real regression loss.
-        mag_all_reg_loss = pred_log_mag_all.square().mean()
+        # 3) Gaussian-weighted angular bias regression.
+        # Only bins whose target correction is within the configured bias range
+        # are trained; this preserves the meaning of the direction class.
+        bias_target_norm = angle_delta / self.bias_angle_range
+        bias_expr_mask = (bias_target_norm.abs() <= 1.0).float()
+        bias_w = reg_w * bias_expr_mask
+        bias_loss_all_bins = F.smooth_l1_loss(
+            pred_bias_norm_all,
+            bias_target_norm.clamp(min=-1.0, max=1.0),
+            reduction="none",
+        )
+        bias_loss = (bias_w * bias_loss_all_bins).sum() / bias_w.sum().clamp_min(1.0)
 
-        # 4) Trajectory reconstruction loss. Use GT direction bins so this loss
-        # does not push direction logits toward soft averaged directions.
-        unit_gt = self.unit_dirs.to(device=dir_logits.device, dtype=dir_logits.dtype)[dir_target]
-        ndelta_pred_for_traj = pred_mag_gt_dir[..., None] * unit_gt
-        naction_pred_for_traj = self._cumsum_actions(ndelta_pred_for_traj, n_agent_pos)
-        traj_loss = F.smooth_l1_loss(naction_pred_for_traj, naction_target)
+        # 4) (1 - weight) magnitude prior for all experts.
+        # Far-away experts should not learn the current action, but they also
+        # should not drift to large arbitrary magnitudes. For invalid tiny moves,
+        # every direction is treated as far-away and regularized toward zero.
+        far_w = (1.0 - gauss_w) * valid_float.unsqueeze(-1) + (1.0 - valid_float).unsqueeze(-1)
+        mag_all_reg_loss = (far_w * pred_log_mag_all.square()).sum() / far_w.sum().clamp_min(1.0)
+
+        # 5) Gaussian-weighted vector reconstruction in normalized delta space.
+        centers = self.angle_centers.to(device=dir_logits.device, dtype=dir_logits.dtype)
+        theta_pred_all = centers.view(1, 1, -1) + pred_bias_angle_all
+        unit_pred_all = torch.stack([torch.cos(theta_pred_all), torch.sin(theta_pred_all)], dim=-1)
+        ndelta_pred_all = pred_mag_all.unsqueeze(-1) * unit_pred_all
+        traj_loss_all_bins = F.smooth_l1_loss(
+            ndelta_pred_all,
+            ndelta_gt.unsqueeze(-2).expand_as(ndelta_pred_all),
+            reduction="none",
+        ).mean(dim=-1)
+        traj_loss = (reg_w * traj_loss_all_bins).sum() / reg_w.sum().clamp_min(1.0)
 
         loss = (
             self.dir_loss_weight * dir_loss
             + self.mag_loss_weight * mag_loss
+            + self.bias_loss_weight * bias_loss
             + self.traj_loss_weight * traj_loss
             + self.mag_all_reg_weight * mag_all_reg_loss
         )
@@ -298,19 +364,23 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         with torch.no_grad():
             dir_pred = dir_logits.argmax(dim=-1)
             pred_mag_pred_dir = self._gather_by_dir(pred_mag_all, dir_pred)
-            dir_acc = (
-                (dir_pred == dir_target).float() * valid_float
-            ).sum() / valid_float.sum().clamp_min(1.0)
+            pred_bias_pred_dir = self._gather_by_dir(pred_bias_norm_all, dir_pred)
+            pred_mag_gt_dir = self._gather_by_dir(pred_mag_all, dir_target)
+            pred_bias_gt_dir = self._gather_by_dir(pred_bias_norm_all, dir_target)
+
+            dir_acc = ((dir_pred == dir_target).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
             circular_dist = torch.abs(dir_pred - dir_target)
             circular_dist = torch.minimum(circular_dist, self.num_dir_bins - circular_dist).float()
             dir_within1_acc = ((circular_dist <= 1).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
             dir_within2_acc = ((circular_dist <= 2).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
             dir_mean_bin_error = (circular_dist * valid_float).sum() / valid_float.sum().clamp_min(1.0)
             dir_mean_angle_error_deg = dir_mean_bin_error * (360.0 / self.num_dir_bins)
+
             self.last_loss_info = {
                 "loss": float(loss.detach().cpu()),
                 "dir_loss": float(dir_loss.detach().cpu()),
                 "mag_loss": float(mag_loss.detach().cpu()),
+                "bias_loss": float(bias_loss.detach().cpu()),
                 "traj_loss": float(traj_loss.detach().cpu()),
                 "mag_all_reg_loss": float(mag_all_reg_loss.detach().cpu()),
                 "dir_acc": float(dir_acc.detach().cpu()),
@@ -322,6 +392,10 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
                 "mean_mag_pred": float(pred_mag_pred_dir.detach().mean().cpu()),
                 "mean_mag_pred_gt_dir": float(pred_mag_gt_dir.detach().mean().cpu()),
                 "mean_mag_pred_all": float(pred_mag_all.detach().mean().cpu()),
+                "mean_bias_pred": float(pred_bias_pred_dir.detach().mean().cpu()),
+                "mean_bias_pred_gt_dir": float(pred_bias_gt_dir.detach().mean().cpu()),
+                "mean_gaussian_weight": float(gauss_w.detach().mean().cpu()),
+                "mean_reg_weight_sum": float(reg_w.detach().sum(dim=-1).mean().cpu()),
                 "valid_dir_ratio": float(valid_float.detach().mean().cpu()),
             }
 
@@ -329,6 +403,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "loss": loss,
             "dir_loss": dir_loss.detach(),
             "mag_loss": mag_loss.detach(),
+            "bias_loss": bias_loss.detach(),
             "traj_loss": traj_loss.detach(),
             "mag_all_reg_loss": mag_all_reg_loss.detach(),
             "dir_acc": dir_acc.detach(),
@@ -340,5 +415,9 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "mean_mag_pred": pred_mag_pred_dir.detach().mean(),
             "mean_mag_pred_gt_dir": pred_mag_gt_dir.detach().mean(),
             "mean_mag_pred_all": pred_mag_all.detach().mean(),
+            "mean_bias_pred": pred_bias_pred_dir.detach().mean(),
+            "mean_bias_pred_gt_dir": pred_bias_gt_dir.detach().mean(),
+            "mean_gaussian_weight": gauss_w.detach().mean(),
+            "mean_reg_weight_sum": reg_w.detach().sum(dim=-1).mean(),
             "valid_dir_ratio": valid_float.detach().mean(),
         }
