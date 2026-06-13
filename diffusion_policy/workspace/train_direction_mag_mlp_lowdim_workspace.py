@@ -251,12 +251,20 @@ class TrainDirectionMagMLPLowdimWorkspace(BaseWorkspace):
                         gt_action = batch["action"]
                         result = policy.predict_action(obs_dict)
                         pred_action = result["action"]
+                        pred_action_full = result.get("action_pred", pred_action)
+
                         start = cfg.n_obs_steps - 1
-                        end = start + cfg.n_action_steps
-                        gt_action = gt_action[:, start:end]
-                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        step_log["train_action_mse_error"] = mse.item()
-                        del batch, obs_dict, gt_action, result, pred_action, mse
+                        exec_end = start + cfg.n_action_steps
+                        pred_end = start + cfg.policy.get("pred_action_steps", cfg.n_action_steps)
+
+                        gt_action_exec = gt_action[:, start:exec_end]
+                        gt_action_full = gt_action[:, start:pred_end]
+
+                        exec_mse = torch.nn.functional.mse_loss(pred_action, gt_action_exec)
+                        full_mse = torch.nn.functional.mse_loss(pred_action_full, gt_action_full)
+                        step_log["train_action_mse_error"] = exec_mse.item()
+                        step_log["train_action_pred_full_mse_error"] = full_mse.item()
+                        del batch, obs_dict, gt_action, gt_action_exec, gt_action_full, result, pred_action, pred_action_full, exec_mse, full_mse
 
                 if (self.epoch % cfg.training.checkpoint_every) == 0:
                     if cfg.checkpoint.save_last_ckpt:

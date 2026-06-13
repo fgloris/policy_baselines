@@ -13,10 +13,14 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
     """
     MLP baseline for Push-T lowdim.
 
-    The policy predicts an action chunk as direction + magnitude in normalized
-    action space:
-      - direction: 32-way categorical bin per action step
-      - magnitude: continuous non-negative step length per action step
+    The policy predicts an action chunk as a small mixture-of-experts in
+    normalized action space:
+      - direction: categorical bin per predicted action step
+      - magnitude: one continuous non-negative step length for every direction bin
+
+    In other words, each predicted step has 64 (direction + regression) experts
+    when num_dir_bins=64. At inference time, the argmax direction selects its
+    own magnitude head instead of sharing one global magnitude regression head.
 
     The first delta is from the current agent position to the first action;
     later deltas are between consecutive action targets. Current agent position
@@ -31,6 +35,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         action_dim: int,
         n_action_steps: int,
         n_obs_steps: int,
+        pred_action_steps: int = None,
         num_dir_bins: int = 32,
         hidden_dim: int = 512,
         depth: int = 4,
@@ -49,6 +54,10 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         super().__init__()
         assert action_dim == 2, "Direction/magnitude baseline currently assumes 2D actions."
         assert num_dir_bins > 1
+        assert n_action_steps >= 1
+        if pred_action_steps is None:
+            pred_action_steps = n_action_steps
+        assert pred_action_steps >= n_action_steps, "pred_action_steps should be >= n_action_steps."
         assert depth >= 1
         assert hidden_dim > 0
         assert 0.0 <= dir_neighbor_smoothing < 0.5
@@ -59,6 +68,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
+        self.pred_action_steps = pred_action_steps
         self.n_obs_steps = n_obs_steps
         self.num_dir_bins = num_dir_bins
         self.hidden_dim = hidden_dim
@@ -93,8 +103,9 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             layers.append(act_cls())
             dim = hidden_dim
         self.trunk = nn.Sequential(*layers)
-        self.dir_head = nn.Linear(hidden_dim, n_action_steps * num_dir_bins)
-        self.mag_head = nn.Linear(hidden_dim, n_action_steps)
+        self.dir_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
+        # Per-direction magnitude experts: [T, K] instead of one shared [T] regressor.
+        self.mag_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
 
         # Start with small positive magnitudes instead of large random moves.
         nn.init.constant_(self.mag_head.bias, mag_head_init_bias)
@@ -124,7 +135,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
 
     def _action_start_end(self) -> Tuple[int, int]:
         start = self.n_obs_steps - 1 if self.oa_step_convention else self.n_obs_steps
-        end = start + self.n_action_steps
+        end = start + self.pred_action_steps
         return start, end
 
     def _current_agent_pos_action_normalized(self, raw_obs: torch.Tensor) -> torch.Tensor:
@@ -135,11 +146,18 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
     def _forward_heads(self, nobs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.trunk(self._obs_cond(nobs))
         B = nobs.shape[0]
-        dir_logits = self.dir_head(h).reshape(B, self.n_action_steps, self.num_dir_bins)
-        # Predict log(1 + r / mag_scale), constrained non-negative.
-        pred_log_mag = F.softplus(self.mag_head(h).reshape(B, self.n_action_steps))
+        dir_logits = self.dir_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
+        # Predict log(1 + r / mag_scale) for every direction bin. Shape: [B, T, K].
+        pred_log_mag = F.softplus(
+            self.mag_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
+        )
         pred_mag = self.mag_scale * torch.expm1(pred_log_mag).clamp_min(0.0)
         return dir_logits, pred_log_mag, pred_mag
+
+    @staticmethod
+    def _gather_by_dir(values: torch.Tensor, dir_idx: torch.Tensor) -> torch.Tensor:
+        # values: [B, T, K], dir_idx: [B, T] -> [B, T].
+        return values.gather(dim=-1, index=dir_idx.unsqueeze(-1)).squeeze(-1)
 
     def _target_delta(self, naction_target: torch.Tensor, n_agent_pos: torch.Tensor) -> torch.Tensor:
         # naction_target: [B, Ta, 2], normalized action targets.
@@ -194,21 +212,27 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         B, _, Do = nobs.shape
         assert Do == self.obs_dim
 
-        dir_logits, pred_log_mag, pred_mag = self._forward_heads(nobs)
+        dir_logits, pred_log_mag_all, pred_mag_all = self._forward_heads(nobs)
         dir_idx = torch.argmax(dir_logits, dim=-1)
+        pred_log_mag = self._gather_by_dir(pred_log_mag_all, dir_idx)
+        pred_mag = self._gather_by_dir(pred_mag_all, dir_idx)
         unit = self.unit_dirs.to(device=dir_logits.device, dtype=dir_logits.dtype)[dir_idx]
         ndelta = pred_mag[..., None] * unit
 
         n_agent_pos = self._current_agent_pos_action_normalized(raw_obs)
-        naction = self._cumsum_actions(ndelta, n_agent_pos)
-        action = self.normalizer["action"].unnormalize(naction)
+        naction_pred = self._cumsum_actions(ndelta, n_agent_pos)
+        action_pred = self.normalizer["action"].unnormalize(naction_pred)
+        # Receding-horizon execution: predict pred_action_steps, execute only n_action_steps.
+        action = action_pred[:, : self.n_action_steps, :]
 
         return {
             "action": action,
-            "action_pred": action,
+            "action_pred": action_pred,
             "dir_logits": dir_logits,
             "mag_log_pred": pred_log_mag,
             "mag_pred": pred_mag,
+            "mag_log_pred_all": pred_log_mag_all,
+            "mag_pred_all": pred_mag_all,
         }
 
     # ========= training ==========
@@ -228,7 +252,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         dir_target, mag_target = self._delta_to_dir_mag(ndelta_gt)
         valid_dir = mag_target > self.dir_eps
 
-        dir_logits, pred_log_mag, pred_mag = self._forward_heads(nobs)
+        dir_logits, pred_log_mag_all, pred_mag_all = self._forward_heads(nobs)
 
         # 1) Direction classification loss. Ignore near-zero displacement frames.
         # Use circular soft labels: target bin gets 1-2*s, adjacent bins get s each.
@@ -238,13 +262,16 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         dir_loss = (ce * valid_float).sum() / valid_float.sum().clamp_min(1.0)
 
         # 2) Magnitude regression loss in log space.
+        # Only the target direction's expert receives the regression target.
         target_log_mag = torch.log1p(mag_target / self.mag_scale)
-        mag_loss = F.smooth_l1_loss(pred_log_mag, target_log_mag)
+        pred_log_mag_gt_dir = self._gather_by_dir(pred_log_mag_all, dir_target)
+        pred_mag_gt_dir = self._gather_by_dir(pred_mag_all, dir_target)
+        mag_loss = F.smooth_l1_loss(pred_log_mag_gt_dir, target_log_mag)
 
         # 3) Trajectory reconstruction loss. Use GT direction bins so this loss
         # does not push direction logits toward soft averaged directions.
         unit_gt = self.unit_dirs.to(device=dir_logits.device, dtype=dir_logits.dtype)[dir_target]
-        ndelta_pred_for_traj = pred_mag[..., None] * unit_gt
+        ndelta_pred_for_traj = pred_mag_gt_dir[..., None] * unit_gt
         naction_pred_for_traj = self._cumsum_actions(ndelta_pred_for_traj, n_agent_pos)
         traj_loss = F.smooth_l1_loss(naction_pred_for_traj, naction_target)
 
@@ -256,6 +283,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
 
         with torch.no_grad():
             dir_pred = dir_logits.argmax(dim=-1)
+            pred_mag_pred_dir = self._gather_by_dir(pred_mag_all, dir_pred)
             dir_acc = (
                 (dir_pred == dir_target).float() * valid_float
             ).sum() / valid_float.sum().clamp_min(1.0)
@@ -276,7 +304,9 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
                 "dir_mean_bin_error": float(dir_mean_bin_error.detach().cpu()),
                 "dir_mean_angle_error_deg": float(dir_mean_angle_error_deg.detach().cpu()),
                 "mean_mag_gt": float(mag_target.detach().mean().cpu()),
-                "mean_mag_pred": float(pred_mag.detach().mean().cpu()),
+                "mean_mag_pred": float(pred_mag_pred_dir.detach().mean().cpu()),
+                "mean_mag_pred_gt_dir": float(pred_mag_gt_dir.detach().mean().cpu()),
+                "mean_mag_pred_all": float(pred_mag_all.detach().mean().cpu()),
                 "valid_dir_ratio": float(valid_float.detach().mean().cpu()),
             }
 
@@ -291,6 +321,8 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "dir_mean_bin_error": dir_mean_bin_error.detach(),
             "dir_mean_angle_error_deg": dir_mean_angle_error_deg.detach(),
             "mean_mag_gt": mag_target.detach().mean(),
-            "mean_mag_pred": pred_mag.detach().mean(),
+            "mean_mag_pred": pred_mag_pred_dir.detach().mean(),
+            "mean_mag_pred_gt_dir": pred_mag_gt_dir.detach().mean(),
+            "mean_mag_pred_all": pred_mag_all.detach().mean(),
             "valid_dir_ratio": valid_float.detach().mean(),
         }

@@ -1,6 +1,6 @@
 defaults:
-  - _self_
   - task: pusht_lowdim
+  - _self_
 
 name: train_direction_mag_mlp_lowdim
 _target_: diffusion_policy.workspace.train_direction_mag_mlp_lowdim_workspace.TrainDirectionMagMLPLowdimWorkspace
@@ -9,15 +9,21 @@ obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
 keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-exp_name: "dir32_mag_mlp512"
+exp_name: "mlp"
 
 horizon: 16
 n_obs_steps: 2
-n_action_steps: 8
+n_action_steps: 1
+pred_action_steps: 8
 n_latency_steps: 0
 past_action_visible: False
 keypoint_visible_rate: 1.0
-pred_action_steps_only: True
+
+# Override dataset padding because the policy is trained to predict pred_action_steps
+# even though the environment executes only n_action_steps.
+task:
+  dataset:
+    pad_after: ${eval:'${pred_action_steps}-1'}
 
 policy:
   _target_: diffusion_policy.policy.direction_mag_mlp_lowdim_policy.DirectionMagMLPLowdimPolicy
@@ -25,17 +31,21 @@ policy:
   horizon: ${horizon}
   obs_dim: ${obs_dim}
   action_dim: ${action_dim}
+  # Rollout execution length. The environment consumes only this many actions.
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  # Supervised prediction length. The network still predicts an 8-step chunk.
+  pred_action_steps: ${pred_action_steps}
   n_obs_steps: ${n_obs_steps}
 
   # 512-MLP baseline
-  num_dir_bins: 45
+  num_dir_bins: 64
   hidden_dim: 512
-  depth: 3
+  depth: 4
   activation: relu
   layer_norm: True
 
-  # Loss = CE + log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
+  # Loss = CE + per-direction log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
+  # Each direction bin has its own magnitude regression head.
   # All losses are computed in normalized action coordinates.
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
@@ -47,6 +57,7 @@ policy:
   # Ignore direction labels when normalized step length is too small.
   dir_eps: 1.0e-2
   # log target is log(1 + ||delta|| / mag_scale) in normalized action space.
+  # The network predicts this value separately for each direction bin.
   mag_scale: 5.0e-2
   mag_head_init_bias: -2.0
   oa_step_convention: True
