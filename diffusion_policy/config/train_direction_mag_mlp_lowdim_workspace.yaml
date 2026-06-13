@@ -9,7 +9,7 @@ obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
 keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-exp_name: "mlp"
+exp_name: "dir_perbin_mag_mlp512_reg_pred8_exec1"
 
 horizon: 16
 n_obs_steps: 2
@@ -43,6 +43,7 @@ policy:
   depth: 4
   activation: relu
   layer_norm: True
+  dropout: 0.08
 
   # Loss = CE + per-direction log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
   # Each direction bin has its own magnitude regression head.
@@ -50,6 +51,9 @@ policy:
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
   traj_loss_weight: 1.0
+  # Small regularizer for all per-direction magnitude experts.
+  # Important because every sample supervises only one of the 64 mag heads.
+  mag_all_reg_weight: 1.0e-3
   # Circular soft labels for direction CE. Target bin gets 0.8, k-1 and k+1 get 0.1 each.
   # Set to 0.0 to recover hard CE.
   dir_neighbor_smoothing: 0.1
@@ -89,7 +93,7 @@ optimizer:
   lr: 3.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 1.0e-4
 
 training:
   device: "cuda:0"

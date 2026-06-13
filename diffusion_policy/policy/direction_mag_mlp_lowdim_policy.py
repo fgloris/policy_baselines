@@ -41,9 +41,11 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         depth: int = 4,
         activation: str = "mish",
         layer_norm: bool = True,
+        dropout: float = 0.0,
         dir_loss_weight: float = 1.0,
         mag_loss_weight: float = 1.0,
         traj_loss_weight: float = 0.5,
+        mag_all_reg_weight: float = 0.0,
         dir_neighbor_smoothing: float = 0.10,
         dir_eps: float = 1.0e-2,
         mag_scale: float = 5.0e-2,
@@ -60,6 +62,8 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         assert pred_action_steps >= n_action_steps, "pred_action_steps should be >= n_action_steps."
         assert depth >= 1
         assert hidden_dim > 0
+        assert 0.0 <= dropout < 1.0
+        assert mag_all_reg_weight >= 0.0
         assert 0.0 <= dir_neighbor_smoothing < 0.5
         if dir_neighbor_smoothing > 0.0:
             assert num_dir_bins > 2, "Neighbor smoothing needs at least 3 direction bins."
@@ -73,9 +77,11 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         self.num_dir_bins = num_dir_bins
         self.hidden_dim = hidden_dim
         self.depth = depth
+        self.dropout = dropout
         self.dir_loss_weight = dir_loss_weight
         self.mag_loss_weight = mag_loss_weight
         self.traj_loss_weight = traj_loss_weight
+        self.mag_all_reg_weight = mag_all_reg_weight
         self.dir_neighbor_smoothing = dir_neighbor_smoothing
         self.dir_eps = dir_eps
         self.mag_scale = mag_scale
@@ -101,6 +107,8 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             if layer_norm:
                 layers.append(nn.LayerNorm(hidden_dim))
             layers.append(act_cls())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
             dim = hidden_dim
         self.trunk = nn.Sequential(*layers)
         self.dir_head = nn.Linear(hidden_dim, self.pred_action_steps * num_dir_bins)
@@ -268,7 +276,12 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         pred_mag_gt_dir = self._gather_by_dir(pred_mag_all, dir_target)
         mag_loss = F.smooth_l1_loss(pred_log_mag_gt_dir, target_log_mag)
 
-        # 3) Trajectory reconstruction loss. Use GT direction bins so this loss
+        # 3) Tiny magnitude prior for all experts. For each sample only one
+        # direction expert is supervised, so this keeps unused heads from drifting
+        # to large arbitrary values without dominating the real regression loss.
+        mag_all_reg_loss = pred_log_mag_all.square().mean()
+
+        # 4) Trajectory reconstruction loss. Use GT direction bins so this loss
         # does not push direction logits toward soft averaged directions.
         unit_gt = self.unit_dirs.to(device=dir_logits.device, dtype=dir_logits.dtype)[dir_target]
         ndelta_pred_for_traj = pred_mag_gt_dir[..., None] * unit_gt
@@ -279,6 +292,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             self.dir_loss_weight * dir_loss
             + self.mag_loss_weight * mag_loss
             + self.traj_loss_weight * traj_loss
+            + self.mag_all_reg_weight * mag_all_reg_loss
         )
 
         with torch.no_grad():
@@ -298,6 +312,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
                 "dir_loss": float(dir_loss.detach().cpu()),
                 "mag_loss": float(mag_loss.detach().cpu()),
                 "traj_loss": float(traj_loss.detach().cpu()),
+                "mag_all_reg_loss": float(mag_all_reg_loss.detach().cpu()),
                 "dir_acc": float(dir_acc.detach().cpu()),
                 "dir_within1_acc": float(dir_within1_acc.detach().cpu()),
                 "dir_within2_acc": float(dir_within2_acc.detach().cpu()),
@@ -315,6 +330,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "dir_loss": dir_loss.detach(),
             "mag_loss": mag_loss.detach(),
             "traj_loss": traj_loss.detach(),
+            "mag_all_reg_loss": mag_all_reg_loss.detach(),
             "dir_acc": dir_acc.detach(),
             "dir_within1_acc": dir_within1_acc.detach(),
             "dir_within2_acc": dir_within2_acc.detach(),
