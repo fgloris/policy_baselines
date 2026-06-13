@@ -39,6 +39,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         dir_loss_weight: float = 1.0,
         mag_loss_weight: float = 1.0,
         traj_loss_weight: float = 0.5,
+        dir_neighbor_smoothing: float = 0.10,
         dir_eps: float = 1.0e-2,
         mag_scale: float = 5.0e-2,
         mag_head_init_bias: float = -2.0,
@@ -50,6 +51,9 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         assert num_dir_bins > 1
         assert depth >= 1
         assert hidden_dim > 0
+        assert 0.0 <= dir_neighbor_smoothing < 0.5
+        if dir_neighbor_smoothing > 0.0:
+            assert num_dir_bins > 2, "Neighbor smoothing needs at least 3 direction bins."
 
         self.horizon = horizon
         self.obs_dim = obs_dim
@@ -62,6 +66,7 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         self.dir_loss_weight = dir_loss_weight
         self.mag_loss_weight = mag_loss_weight
         self.traj_loss_weight = traj_loss_weight
+        self.dir_neighbor_smoothing = dir_neighbor_smoothing
         self.dir_eps = dir_eps
         self.mag_scale = mag_scale
         self.oa_step_convention = oa_step_convention
@@ -152,6 +157,33 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
     def _cumsum_actions(self, ndelta: torch.Tensor, n_agent_pos: torch.Tensor) -> torch.Tensor:
         return n_agent_pos[:, None, :] + torch.cumsum(ndelta, dim=1)
 
+    def _circular_neighbor_ce(self, dir_logits: torch.Tensor, dir_target: torch.Tensor) -> torch.Tensor:
+        """Per-step CE with circular soft labels.
+
+        The target bin keeps most mass, while its immediate circular neighbors
+        k-1 and k+1 receive a small mass. This prevents adjacent directions
+        from being penalized as harshly as completely opposite directions.
+        Returns [B, T] unreduced loss.
+        """
+        eps = self.dir_neighbor_smoothing
+        if eps <= 0.0:
+            return F.cross_entropy(
+                dir_logits.reshape(-1, self.num_dir_bins),
+                dir_target.reshape(-1),
+                reduction="none",
+            ).reshape(dir_target.shape)
+
+        log_probs = F.log_softmax(dir_logits, dim=-1)
+        soft_target = torch.zeros_like(log_probs)
+        center_prob = 1.0 - 2.0 * eps
+        left_target = (dir_target - 1) % self.num_dir_bins
+        right_target = (dir_target + 1) % self.num_dir_bins
+
+        soft_target.scatter_(-1, dir_target.unsqueeze(-1), center_prob)
+        soft_target.scatter_(-1, left_target.unsqueeze(-1), eps)
+        soft_target.scatter_(-1, right_target.unsqueeze(-1), eps)
+        return -(soft_target * log_probs).sum(dim=-1)
+
     # ========= inference ==========
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         assert "obs" in obs_dict
@@ -199,11 +231,9 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         dir_logits, pred_log_mag, pred_mag = self._forward_heads(nobs)
 
         # 1) Direction classification loss. Ignore near-zero displacement frames.
-        ce = F.cross_entropy(
-            dir_logits.reshape(-1, self.num_dir_bins),
-            dir_target.reshape(-1),
-            reduction="none",
-        ).reshape_as(mag_target)
+        # Use circular soft labels: target bin gets 1-2*s, adjacent bins get s each.
+        # This makes +/-1-bin mistakes much cheaper than far-away direction mistakes.
+        ce = self._circular_neighbor_ce(dir_logits, dir_target)
         valid_float = valid_dir.float()
         dir_loss = (ce * valid_float).sum() / valid_float.sum().clamp_min(1.0)
 
@@ -225,15 +255,26 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
         )
 
         with torch.no_grad():
+            dir_pred = dir_logits.argmax(dim=-1)
             dir_acc = (
-                (dir_logits.argmax(dim=-1) == dir_target).float() * valid_float
+                (dir_pred == dir_target).float() * valid_float
             ).sum() / valid_float.sum().clamp_min(1.0)
+            circular_dist = torch.abs(dir_pred - dir_target)
+            circular_dist = torch.minimum(circular_dist, self.num_dir_bins - circular_dist).float()
+            dir_within1_acc = ((circular_dist <= 1).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+            dir_within2_acc = ((circular_dist <= 2).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+            dir_mean_bin_error = (circular_dist * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+            dir_mean_angle_error_deg = dir_mean_bin_error * (360.0 / self.num_dir_bins)
             self.last_loss_info = {
                 "loss": float(loss.detach().cpu()),
                 "dir_loss": float(dir_loss.detach().cpu()),
                 "mag_loss": float(mag_loss.detach().cpu()),
                 "traj_loss": float(traj_loss.detach().cpu()),
                 "dir_acc": float(dir_acc.detach().cpu()),
+                "dir_within1_acc": float(dir_within1_acc.detach().cpu()),
+                "dir_within2_acc": float(dir_within2_acc.detach().cpu()),
+                "dir_mean_bin_error": float(dir_mean_bin_error.detach().cpu()),
+                "dir_mean_angle_error_deg": float(dir_mean_angle_error_deg.detach().cpu()),
                 "mean_mag_gt": float(mag_target.detach().mean().cpu()),
                 "mean_mag_pred": float(pred_mag.detach().mean().cpu()),
                 "valid_dir_ratio": float(valid_float.detach().mean().cpu()),
@@ -245,6 +286,10 @@ class DirectionMagMLPLowdimPolicy(BaseLowdimPolicy):
             "mag_loss": mag_loss.detach(),
             "traj_loss": traj_loss.detach(),
             "dir_acc": dir_acc.detach(),
+            "dir_within1_acc": dir_within1_acc.detach(),
+            "dir_within2_acc": dir_within2_acc.detach(),
+            "dir_mean_bin_error": dir_mean_bin_error.detach(),
+            "dir_mean_angle_error_deg": dir_mean_angle_error_deg.detach(),
             "mean_mag_gt": mag_target.detach().mean(),
             "mean_mag_pred": pred_mag.detach().mean(),
             "valid_dir_ratio": valid_float.detach().mean(),

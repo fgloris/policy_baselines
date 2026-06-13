@@ -29,17 +29,20 @@ policy:
   n_obs_steps: ${n_obs_steps}
 
   # 512-MLP baseline
-  num_dir_bins: 32
+  num_dir_bins: 45
   hidden_dim: 512
-  depth: 4
-  activation: mish
+  depth: 3
+  activation: relu
   layer_norm: True
 
   # Loss = CE + log-magnitude SmoothL1 + GT-direction trajectory SmoothL1.
   # All losses are computed in normalized action coordinates.
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
-  traj_loss_weight: 0.5
+  traj_loss_weight: 1.0
+  # Circular soft labels for direction CE. Target bin gets 0.8, k-1 and k+1 get 0.1 each.
+  # Set to 0.0 to recover hard CE.
+  dir_neighbor_smoothing: 0.1
 
   # Ignore direction labels when normalized step length is too small.
   dir_eps: 1.0e-2
@@ -57,14 +60,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 256
+  batch_size: 512
   num_workers: 1
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 256
+  batch_size: 512
   num_workers: 1
   shuffle: False
   pin_memory: True
@@ -84,7 +87,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 5000
+  num_epochs: 20000
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 50
@@ -108,7 +111,7 @@ checkpoint:
   topk:
     monitor_key: test_mean_score
     mode: max
-    k: 5
+    k: 8
     format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
