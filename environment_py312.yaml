@@ -5,5 +5,3 @@ dependencies:
   - python=3.12
   - pip
   - ffmpeg
-  - pip:
-      - -r requirements_py312.txt
