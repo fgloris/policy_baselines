@@ -10,19 +10,26 @@ from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 
 
-class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
-    """Conditional flow-matching policy for low-dimensional action chunks.
+class XPredDiffusionUnetLowdimPolicy(BaseLowdimPolicy):
+    """JiT-style x-prediction diffusion / ODE policy for low-dimensional actions.
 
-    This is the continuous CondOT / rectified-flow objective:
-        x_t = (1 - t) * x_0 + t * x_1
-        u_t = d x_t / d t = x_1 - x_0
+    This policy intentionally mirrors DiffusionUnetLowdimPolicy's public API so it
+    can reuse TrainDiffusionUnetLowdimWorkspace, the same dataset, the same
+    normalizer, and the same ConditionalUnet1D backbone.
 
-    where x_1 is the normalized target action trajectory and x_0 is sampled from
-    the same source distribution used at inference time.  The default source is
-    N(0, source_noise_std^2 I).  The network predicts u_t.
+    Difference from the original epsilon-prediction diffusion policy:
+        - the network directly predicts the clean trajectory x_1 (x-prediction);
+        - training noising path is z_t = t * x_1 + (1 - t) * eps;
+        - by default, the loss is JiT's velocity-space loss:
+              v      = (x_1      - z_t) / max(1 - t, denom_clip)
+              v_pred = (x_pred   - z_t) / max(1 - t, denom_clip)
+          while the direct network output remains x_pred;
+        - sampling starts from Gaussian noise and integrates the ODE velocity
+          induced by x_pred.
 
-    The class intentionally mirrors DiffusionUnetLowdimPolicy so it can reuse
-    TrainDiffusionUnetLowdimWorkspace without changing train.py or the workspace.
+    If you want the most literal "DDPM sample-prediction" baseline, set
+    loss_type='x' and solver='midpoint_euler'.  The default loss_type='velocity'
+    follows the JiT paper more closely.
     """
 
     def __init__(
@@ -33,16 +40,23 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         action_dim: int,
         n_action_steps: int,
         n_obs_steps: int,
-        num_inference_steps: int = 20,
+        num_inference_steps: int = 50,
         obs_as_local_cond: bool = False,
         obs_as_global_cond: bool = False,
         pred_action_steps_only: bool = False,
         oa_step_convention: bool = False,
         source_noise_std: float = 1.0,
-        time_scale: float = 100.0,
-        t_min: float = 0.0,
-        t_max: float = 1.0,
-        inference_mode: str = "midpoint_euler",
+        time_embed_scale: float = 100.0,
+        t_min: float = 1.0e-4,
+        t_max: float = 0.9999,
+        time_sampler: str = "logit_normal",
+        time_mu: float = -0.8,
+        time_sigma: float = 0.8,
+        denom_clip: float = 0.05,
+        loss_type: str = "velocity",
+        solver: str = "heun",
+        clamp_sample: bool = True,
+        clamp_value: float = 1.2,
         **kwargs,
     ):
         super().__init__()
@@ -52,7 +66,11 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         assert num_inference_steps >= 1
         assert source_noise_std > 0
         assert 0.0 <= t_min < t_max <= 1.0
-        assert inference_mode in ["euler", "midpoint_euler"]
+        assert time_sampler in ["uniform", "logit_normal"]
+        assert denom_clip > 0
+        assert loss_type in ["velocity", "x"]
+        assert solver in ["euler", "midpoint_euler", "heun"]
+        assert clamp_value > 0
 
         self.model = model
         self.mask_generator = LowdimMaskGenerator(
@@ -74,25 +92,44 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.oa_step_convention = oa_step_convention
         self.source_noise_std = source_noise_std
-        self.time_scale = time_scale
+        self.time_embed_scale = time_embed_scale
         self.t_min = t_min
         self.t_max = t_max
-        self.inference_mode = inference_mode
+        self.time_sampler = time_sampler
+        self.time_mu = time_mu
+        self.time_sigma = time_sigma
+        self.denom_clip = denom_clip
+        self.loss_type = loss_type
+        self.solver = solver
+        self.clamp_sample = clamp_sample
+        self.clamp_value = clamp_value
         self.kwargs = kwargs
 
     # ========= helpers ==========
+    def _time_for_model(self, t: torch.Tensor) -> torch.Tensor:
+        # ConditionalUnet1D was written for discrete diffusion-step embeddings.
+        # Scaling continuous t back to roughly [0, 100] keeps the embedding scale
+        # comparable to the original DDPM lowdim baseline.
+        return t * self.time_embed_scale
+
     def _make_time(self, batch_size: int, device: torch.device, dtype: torch.dtype):
-        t = torch.rand(batch_size, device=device, dtype=dtype)
+        if self.time_sampler == "logit_normal":
+            t = torch.randn(batch_size, device=device, dtype=dtype)
+            t = torch.sigmoid(self.time_mu + self.time_sigma * t)
+        else:
+            t = torch.rand(batch_size, device=device, dtype=dtype)
+
         if self.t_min != 0.0 or self.t_max != 1.0:
-            t = self.t_min + (self.t_max - self.t_min) * t
+            t = t.clamp(self.t_min, self.t_max)
         return t
 
-    def _time_for_model(self, t: torch.Tensor) -> torch.Tensor:
-        # ConditionalUnet1D uses sinusoidal embeddings.  Scaling t from [0, 1]
-        # to roughly the old DDPM range makes the time embedding less tiny.
-        return t * self.time_scale
-
-    def _sample_source(self, shape, device, dtype, generator: Optional[torch.Generator] = None):
+    def _sample_source(
+        self,
+        shape,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: Optional[torch.Generator] = None,
+    ):
         return self.source_noise_std * torch.randn(
             size=shape,
             device=device,
@@ -100,13 +137,20 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
             generator=generator,
         )
 
-    def _build_cond_and_trajectory(self, obs: torch.Tensor, action: Optional[torch.Tensor] = None):
-        """Build conditioning tensors, matching DiffusionUnetLowdimPolicy.
+    def _denom(self, t: torch.Tensor, ndim: int):
+        denom = (1.0 - t).clamp_min(self.denom_clip)
+        return denom.reshape(t.shape[0], *([1] * (ndim - 1)))
 
-        During training, action is provided and returns the normalized target
-        trajectory x_1.  During inference, action is None and only shapes / cond
-        tensors are returned.
-        """
+    def _velocity_from_xpred(self, z: torch.Tensor, t: torch.Tensor, x_pred: torch.Tensor):
+        return (x_pred - z) / self._denom(t, z.ndim)
+
+    def _post_step(self, z: torch.Tensor, condition_data: torch.Tensor, condition_mask: torch.Tensor):
+        z = torch.where(condition_mask, condition_data, z)
+        if self.clamp_sample:
+            z = z.clamp(-self.clamp_value, self.clamp_value)
+        return z
+
+    def _build_cond_and_trajectory(self, obs: torch.Tensor, action: Optional[torch.Tensor] = None):
         local_cond = None
         global_cond = None
         trajectory = action
@@ -163,6 +207,16 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         return cond_data, cond_mask, local_cond, global_cond
 
     # ========= inference ==========
+    def _predict_velocity(self, z, t, local_cond=None, global_cond=None):
+        x_pred = self.model(
+            z,
+            self._time_for_model(t),
+            local_cond=local_cond,
+            global_cond=global_cond,
+        )
+        v_pred = self._velocity_from_xpred(z, t, x_pred)
+        return v_pred, x_pred
+
     def conditional_sample(
         self,
         condition_data: torch.Tensor,
@@ -173,41 +227,47 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         **kwargs,
     ):
         del kwargs
-        trajectory = self._sample_source(
+        z = self._sample_source(
             condition_data.shape,
             device=condition_data.device,
             dtype=condition_data.dtype,
             generator=generator,
         )
+        z = torch.where(condition_mask, condition_data, z)
 
+        B = z.shape[0]
         dt = 1.0 / float(self.num_inference_steps)
-        B = trajectory.shape[0]
 
         for i in range(self.num_inference_steps):
-            if self.inference_mode == "midpoint_euler":
+            if self.solver == "midpoint_euler":
                 t_value = (i + 0.5) * dt
-            else:
+                t = torch.full((B,), t_value, device=z.device, dtype=z.dtype)
+                z = torch.where(condition_mask, condition_data, z)
+                v, _ = self._predict_velocity(z, t, local_cond, global_cond)
+                z = z + dt * v
+            elif self.solver == "euler":
                 t_value = i * dt
-            t = torch.full(
-                (B,),
-                t_value,
-                device=trajectory.device,
-                dtype=trajectory.dtype,
-            )
+                t = torch.full((B,), t_value, device=z.device, dtype=z.dtype)
+                z = torch.where(condition_mask, condition_data, z)
+                v, _ = self._predict_velocity(z, t, local_cond, global_cond)
+                z = z + dt * v
+            else:  # heun
+                t0_value = i * dt
+                t1_value = min((i + 1) * dt, 1.0)
+                t0 = torch.full((B,), t0_value, device=z.device, dtype=z.dtype)
+                t1 = torch.full((B,), t1_value, device=z.device, dtype=z.dtype)
 
-            # Enforce known observations for inpainting-style conditioning.
-            trajectory = torch.where(condition_mask, condition_data, trajectory)
-            velocity = self.model(
-                trajectory,
-                self._time_for_model(t),
-                local_cond=local_cond,
-                global_cond=global_cond,
-            )
-            trajectory = trajectory + dt * velocity
-            trajectory = trajectory.clamp(-1.2, 1.2)
+                z = torch.where(condition_mask, condition_data, z)
+                v0, _ = self._predict_velocity(z, t0, local_cond, global_cond)
+                z_euler = z + dt * v0
+                z_euler = self._post_step(z_euler, condition_data, condition_mask)
+                v1, _ = self._predict_velocity(z_euler, t1, local_cond, global_cond)
+                z = z + 0.5 * dt * (v0 + v1)
 
-        trajectory = torch.where(condition_mask, condition_data, trajectory)
-        return trajectory
+            z = self._post_step(z, condition_data, condition_mask)
+
+        z = torch.where(condition_mask, condition_data, z)
+        return z
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         assert "obs" in obs_dict
@@ -265,36 +325,37 @@ class FlowMatchingLowdimPolicy(BaseLowdimPolicy):
         obs = nbatch["obs"]
         action = nbatch["action"]
 
-        trajectory, local_cond, global_cond = self._build_cond_and_trajectory(obs, action)
+        x1, local_cond, global_cond = self._build_cond_and_trajectory(obs, action)
 
         if self.pred_action_steps_only:
-            condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
+            condition_mask = torch.zeros_like(x1, dtype=torch.bool)
         else:
-            condition_mask = self.mask_generator(trajectory.shape)
+            condition_mask = self.mask_generator(x1.shape)
         loss_mask = ~condition_mask
 
-        x1 = trajectory
-        x0 = self._sample_source(x1.shape, device=x1.device, dtype=x1.dtype)
-
+        eps = self._sample_source(x1.shape, device=x1.device, dtype=x1.dtype)
         B = x1.shape[0]
         t = self._make_time(B, device=x1.device, dtype=x1.dtype)
         t_view = t.reshape(B, *([1] * (x1.ndim - 1)))
 
-        xt = (1.0 - t_view) * x0 + t_view * x1
-        target_velocity = x1 - x0
+        z = t_view * x1 + (1.0 - t_view) * eps
+        z = torch.where(condition_mask, x1, z)
 
-        # Known conditioning values should remain clean, just like the diffusion
-        # policy's inpainting path.
-        xt = torch.where(condition_mask, x1, xt)
-
-        pred_velocity = self.model(
-            xt,
+        x_pred = self.model(
+            z,
             self._time_for_model(t),
             local_cond=local_cond,
             global_cond=global_cond,
         )
 
-        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
+        if self.loss_type == "velocity":
+            target = (x1 - z) / self._denom(t, x1.ndim)
+            pred = (x_pred - z) / self._denom(t, x1.ndim)
+        else:
+            target = x1
+            pred = x_pred
+
+        loss = F.mse_loss(pred, target, reduction="none")
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, "b ... -> b (...)", "mean")
         loss = loss.mean()

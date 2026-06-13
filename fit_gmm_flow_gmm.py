@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Fit a GMM on normalized Push-T lowdim action chunks for gmm_flow.
+"""Fit a GMM on Push-T lowdim relative action chunks for gmm_flow.
 
 Example:
   python scripts/fit_gmm_flow_gmm.py \
     --n-components 16 \
     --covariance-type diag
 
-The policy expects the GMM to be fitted in the same normalized action space used
-by the training dataset normalizer, and on the same action chunk slice.
+The updated policy classifies relative action chunks:
+    relative_action[t] = action[t] - current_agent_pos
+where current_agent_pos is the last visible lowdim observation position.
+
+The GMM is fitted on normalized relative chunks with a relative-action normalizer
+saved in this npz file. The policy then samples a relative source chunk and
+converts it back to an absolute action source for the flow head.
 """
 
 from __future__ import annotations
@@ -28,7 +33,6 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.dataset.pusht_dataset import PushTLowdimDataset
 
 
@@ -49,7 +53,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap for quick experiments.")
-    parser.add_argument("--normalizer-mode", type=str, default="limits", choices=["limits", "gaussian"])
+    parser.add_argument("--normalizer-mode", type=str, default="limits", choices=["limits", "gaussian"], help="Kept for dataset normalizer compatibility; the GMM itself uses --relative-normalizer-mode.")
+    parser.add_argument("--relative-normalizer-mode", type=str, default="limits", choices=["limits", "gaussian"], help="How to normalize raw relative actions before fitting the GMM.")
     parser.add_argument("--reg-covar", type=float, default=1e-6)
     parser.add_argument("--n-init", type=int, default=5)
     parser.add_argument("--max-iter", type=int, default=500)
@@ -77,7 +82,8 @@ def main():
         val_ratio=args.val_ratio,
         max_train_episodes=args.max_train_episodes,
     )
-    normalizer = dataset.get_normalizer(mode=args.normalizer_mode)
+    # Keep the same dataset slicing parameters as training. The GMM feature itself
+    # is normalized by rel_action_scale/rel_action_offset below, not by the dataset normalizer.
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -86,27 +92,47 @@ def main():
         pin_memory=False,
     )
 
-    chunks: List[np.ndarray] = []
     seen = 0
+    rel_chunks_raw: List[np.ndarray] = []
     print(
-        f"Collecting normalized action chunks: start={start}, end={end}, "
+        f"Collecting raw relative action chunks: start={start}, end={end}, "
         f"chunk_shape=({action_steps}, 2), dataset_len={len(dataset)}"
     )
     for batch in tqdm(loader):
-        nbatch = normalizer.normalize(batch)
-        action = nbatch["action"][:, start:end]
-        flat = action.reshape(action.shape[0], -1).detach().cpu().numpy().astype(np.float32)
-        if args.max_samples is not None and seen + flat.shape[0] > args.max_samples:
-            flat = flat[: args.max_samples - seen]
-        chunks.append(flat)
-        seen += flat.shape[0]
+        # PushTLowdimDataset obs = [keypoints..., agent_x, agent_y].
+        # Use the latest visible obs position as the current circular end-effector position.
+        current_agent_pos = batch["obs"][:, args.n_obs_steps - 1, -2:]
+        action_chunk = batch["action"][:, start:end]
+        rel = action_chunk - current_agent_pos[:, None, :]
+        rel_np = rel.detach().cpu().numpy().astype(np.float32)
+        if args.max_samples is not None and seen + rel_np.shape[0] > args.max_samples:
+            rel_np = rel_np[: args.max_samples - seen]
+        rel_chunks_raw.append(rel_np)
+        seen += rel_np.shape[0]
         if args.max_samples is not None and seen >= args.max_samples:
             break
 
-    x = np.concatenate(chunks, axis=0)
+    rel_raw = np.concatenate(rel_chunks_raw, axis=0)
+    rel_flat_for_stats = rel_raw.reshape(-1, 2)
+    if args.relative_normalizer_mode == "limits":
+        rel_min = rel_flat_for_stats.min(axis=0)
+        rel_max = rel_flat_for_stats.max(axis=0)
+        rel_range = np.maximum(rel_max - rel_min, 1e-7)
+        rel_action_scale = (2.0 / rel_range).astype(np.float32)
+        rel_action_offset = (-1.0 - rel_action_scale * rel_min).astype(np.float32)
+    else:
+        rel_mean = rel_flat_for_stats.mean(axis=0)
+        rel_std = np.maximum(rel_flat_for_stats.std(axis=0), 1e-6)
+        rel_action_scale = (1.0 / rel_std).astype(np.float32)
+        rel_action_offset = (-rel_mean / rel_std).astype(np.float32)
+
+    x_chunks = rel_raw * rel_action_scale.reshape(1, 1, 2) + rel_action_offset.reshape(1, 1, 2)
+    x = x_chunks.reshape(x_chunks.shape[0], -1).astype(np.float32)
     if x.shape[0] < args.n_components:
         raise ValueError(f"Need at least K samples, got {x.shape[0]} samples for K={args.n_components}.")
-    print(f"Fitting GaussianMixture on {x.shape[0]} chunks with dim={x.shape[1]}...")
+    print(f"Fitting GaussianMixture on {x.shape[0]} relative chunks with dim={x.shape[1]}...")
+    print(f"Relative normalizer mode: {args.relative_normalizer_mode}")
+    print(f"rel_action_scale={rel_action_scale}, rel_action_offset={rel_action_offset}")
 
     gmm = GaussianMixture(
         n_components=args.n_components,
@@ -147,6 +173,14 @@ def main():
         chunk_start=np.array(start, dtype=np.int64),
         chunk_end=np.array(end, dtype=np.int64),
         normalizer_mode=np.array(args.normalizer_mode),
+        gmm_feature_space=np.array("relative_action_minus_current_agent_pos"),
+        relative_normalizer_mode=np.array(args.relative_normalizer_mode),
+        rel_action_scale=rel_action_scale.astype(np.float32),
+        rel_action_offset=rel_action_offset.astype(np.float32),
+        rel_action_min=rel_flat_for_stats.min(axis=0).astype(np.float32),
+        rel_action_max=rel_flat_for_stats.max(axis=0).astype(np.float32),
+        rel_action_mean=rel_flat_for_stats.mean(axis=0).astype(np.float32),
+        rel_action_std=rel_flat_for_stats.std(axis=0).astype(np.float32),
         seed=np.array(args.seed, dtype=np.int64),
         bic=np.array(bic, dtype=np.float64),
         aic=np.array(aic, dtype=np.float64),

@@ -5,10 +5,12 @@ This policy implements the user's proposed baseline:
   2. sample a source action chunk from that GMM component;
   3. run conditional flow matching from the component source to the final action.
 
-The GMM is fitted offline on *normalized* action chunks with
-`scripts/fit_gmm_flow_gmm.py`.  At training time the ground-truth action chunk is
-assigned to the most likely GMM component and the flow head is conditioned on the
-GT component.  At inference time the classifier predicts the component.
+The GMM is fitted offline on normalized *relative* action chunks with
+`scripts/fit_gmm_flow_gmm.py`: rel_action = action - current_agent_pos.
+At training time the ground-truth relative chunk is assigned to the most likely
+GMM component and the flow head is conditioned on the GT component. At inference
+time the classifier predicts the component, samples a relative source chunk, then
+converts it back to an absolute action source before flow integration.
 """
 
 from __future__ import annotations
@@ -182,6 +184,13 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
         weights = np.asarray(data["weights"], dtype=np.float32)
         covariance_type = str(data["covariance_type"].item() if data["covariance_type"].shape == () else data["covariance_type"])
         covariances = np.asarray(data["covariances"], dtype=np.float32)
+        if "rel_action_scale" not in data or "rel_action_offset" not in data:
+            raise ValueError(
+                "This policy now expects a relative-action GMM fitted by the updated "
+                "scripts/fit_gmm_flow_gmm.py. Missing rel_action_scale/rel_action_offset."
+            )
+        rel_action_scale = np.asarray(data["rel_action_scale"], dtype=np.float32)
+        rel_action_offset = np.asarray(data["rel_action_offset"], dtype=np.float32)
 
         expected_dim = self.n_action_steps * self.action_dim
         if means.ndim != 2:
@@ -209,6 +218,8 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
 
         self.register_buffer("gmm_means", torch.from_numpy(means))
         self.register_buffer("gmm_log_weights", torch.log(torch.from_numpy(weights)))
+        self.register_buffer("rel_action_scale", torch.from_numpy(rel_action_scale.reshape(1, 1, self.action_dim)))
+        self.register_buffer("rel_action_offset", torch.from_numpy(rel_action_offset.reshape(1, 1, self.action_dim)))
 
         if covariance_type == "diag":
             if covariances.shape != means.shape:
@@ -259,9 +270,33 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
         x_flat = x.reshape(x.shape[0], -1)
         return self._gmm_log_prob(x_flat).argmax(dim=-1)
 
+    def _normalize_relative_action(self, rel_action: torch.Tensor) -> torch.Tensor:
+        scale = self.rel_action_scale.to(device=rel_action.device, dtype=rel_action.dtype)
+        offset = self.rel_action_offset.to(device=rel_action.device, dtype=rel_action.dtype)
+        return rel_action * scale + offset
+
+    def _unnormalize_relative_action(self, nrel_action: torch.Tensor) -> torch.Tensor:
+        scale = self.rel_action_scale.to(device=nrel_action.device, dtype=nrel_action.dtype)
+        offset = self.rel_action_offset.to(device=nrel_action.device, dtype=nrel_action.dtype)
+        return (nrel_action - offset) / scale.clamp(min=1e-12)
+
+    def _current_agent_pos_raw(self, obs_raw: torch.Tensor) -> torch.Tensor:
+        # PushT lowdim obs is [keypoints..., agent_x, agent_y]. Use the latest
+        # visible observation as the current end-effector/agent position.
+        return obs_raw[:, self.n_obs_steps - 1, -self.action_dim:]
+
+    def _relative_chunk_raw(self, action_raw: torch.Tensor, obs_raw: torch.Tensor) -> torch.Tensor:
+        action_chunk_raw = self._action_chunk(action_raw)
+        cur_pos = self._current_agent_pos_raw(obs_raw)
+        return action_chunk_raw - cur_pos[:, None, :]
+
+    def _absolute_to_normalized_action(self, action_raw: torch.Tensor) -> torch.Tensor:
+        return self.normalizer["action"].normalize(action_raw)
+
     def _sample_gmm_source(
         self,
         labels: torch.Tensor,
+        current_agent_pos_raw: torch.Tensor,
         shape_dtype: torch.dtype,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
@@ -288,7 +323,10 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
             )
             x_flat = means + self.source_noise_scale * torch.bmm(chol, eps.unsqueeze(-1)).squeeze(-1)
 
-        return x_flat.to(dtype=shape_dtype).reshape(labels.shape[0], self.n_action_steps, self.action_dim)
+        nrel = x_flat.to(dtype=shape_dtype).reshape(labels.shape[0], self.n_action_steps, self.action_dim)
+        rel_raw = self._unnormalize_relative_action(nrel)
+        abs_raw = rel_raw + current_agent_pos_raw.to(dtype=shape_dtype)[:, None, :]
+        return self._absolute_to_normalized_action(abs_raw)
 
     # ---------------------------------------------------------------------
     # Conditioning and time utilities
@@ -320,9 +358,15 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
         self,
         labels: torch.Tensor,
         global_cond: torch.Tensor,
+        current_agent_pos_raw: torch.Tensor,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        trajectory = self._sample_gmm_source(labels, shape_dtype=self.dtype, generator=generator)
+        trajectory = self._sample_gmm_source(
+            labels,
+            current_agent_pos_raw=current_agent_pos_raw,
+            shape_dtype=self.dtype,
+            generator=generator,
+        )
         dt = 1.0 / float(self.num_inference_steps)
         bsz = trajectory.shape[0]
 
@@ -344,15 +388,19 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
                 global_cond=global_cond,
             )
             trajectory = trajectory + dt * velocity
+            trajectory = trajectory.clamp(-1.2, 1.2)
+            
         return trajectory
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         assert "obs" in obs_dict
         assert "past_action" not in obs_dict
 
-        nobs = self.normalizer["obs"].normalize(obs_dict["obs"])
+        obs_raw = obs_dict["obs"]
+        nobs = self.normalizer["obs"].normalize(obs_raw)
         assert nobs.shape[-1] == self.obs_dim
         obs_cond = self._obs_cond(nobs)
+        current_agent_pos_raw = self._current_agent_pos_raw(obs_raw)
 
         logits = self.classifier(obs_cond)
         if self.inference_class_mode == "sample":
@@ -362,7 +410,11 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
             labels = logits.argmax(dim=-1)
 
         global_cond = self._global_cond(obs_cond, labels)
-        naction_pred = self.conditional_sample(labels=labels, global_cond=global_cond)
+        naction_pred = self.conditional_sample(
+            labels=labels,
+            global_cond=global_cond,
+            current_agent_pos_raw=current_agent_pos_raw,
+        )
         action_pred = self.normalizer["action"].unnormalize(naction_pred)
 
         return {
@@ -383,15 +435,24 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
         nbatch = self.normalizer.normalize(batch)
         obs = nbatch["obs"]
         action = nbatch["action"]
+        obs_raw = batch["obs"]
+        action_raw = batch["action"]
 
         obs_cond = self._obs_cond(obs)
         x1 = self._action_chunk(action)
-        labels = self._gmm_labels(x1)
+        rel_raw = self._relative_chunk_raw(action_raw, obs_raw)
+        nrel = self._normalize_relative_action(rel_raw)
+        labels = self._gmm_labels(nrel)
+        current_agent_pos_raw = self._current_agent_pos_raw(obs_raw)
 
         logits = self.classifier(obs_cond)
         ce_loss = F.cross_entropy(logits, labels)
 
-        x0 = self._sample_gmm_source(labels, shape_dtype=x1.dtype)
+        x0 = self._sample_gmm_source(
+            labels,
+            current_agent_pos_raw=current_agent_pos_raw,
+            shape_dtype=x1.dtype,
+        )
         bsz = x1.shape[0]
         t = self._sample_time(bsz, device=x1.device, dtype=x1.dtype)
         t_view = t.reshape(bsz, *([1] * (x1.ndim - 1)))

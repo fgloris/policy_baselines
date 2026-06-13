@@ -2,14 +2,14 @@ defaults:
   - _self_
   - task: pusht_lowdim
 
-name: train_flow_matching_lowdim
+name: train_ddpm_xpred_unet_lowdim
 _target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
 
 obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
 keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-exp_name: "flow_matching"
+exp_name: "ddpm_xpred"
 
 horizon: 16
 n_obs_steps: 2
@@ -22,7 +22,7 @@ obs_as_global_cond: True
 pred_action_steps_only: False
 
 policy:
-  _target_: diffusion_policy.policy.flow_matching_lowdim_policy.FlowMatchingLowdimPolicy
+  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
 
   model:
     _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
@@ -34,34 +34,30 @@ policy:
     kernel_size: 5
     n_groups: 8
     cond_predict_scale: True
+  
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
+    clip_sample: True # required when predict_epsilon=False
+    prediction_type: sample # x-prediction: predict clean trajectory x_0
 
   horizon: ${horizon}
   obs_dim: ${obs_dim}
   action_dim: ${action_dim}
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
-
-  # Pure conditional flow matching inference steps.
   num_inference_steps: 100
-
   obs_as_local_cond: ${obs_as_local_cond}
   obs_as_global_cond: ${obs_as_global_cond}
   pred_action_steps_only: ${pred_action_steps_only}
   oa_step_convention: True
 
-  # x_0 source distribution is N(0, source_noise_std^2 I) in normalized action space.
-  source_noise_std: 1.0
-
-  # ConditionalUnet1D reuses the old diffusion-step sinusoidal embedding.
-  # Scaling [0,1] to [0,100] makes the embedding numerically similar to DDPM timesteps.
-  time_scale: 100.0
-
-  # Keep full [0,1] CondOT training path. You can set 1e-4 and 0.9999 if endpoint instability appears.
-  t_min: 0.0
-  t_max: 1.0
-
-  # midpoint_euler usually works better than using t=i/N exactly.
-  inference_mode: midpoint_euler
+  # scheduler.step params
+  # predict_epsilon: True
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -97,17 +93,22 @@ training:
   seed: 42
   debug: False
   resume: True
+  # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 2000
   gradient_accumulate_every: 1
   use_ema: True
+  # training loop control
+  # in epochs
   rollout_every: 50
   checkpoint_every: 50
   val_every: 1
   sample_every: 5
+  # steps per epoch
   max_train_steps: null
   max_val_steps: null
+  # misc
   tqdm_interval_sec: 1.0
 
 logging:
