@@ -73,7 +73,6 @@ class PushTImageRunner(BaseImageRunner):
         for i in range(n_train):
             seed = train_start_seed + i
             enable_render = i < n_train_vis
-            enable_render = False
 
             def init_fn(env, seed=seed, enable_render=enable_render):
                 # setup rendering
@@ -100,7 +99,6 @@ class PushTImageRunner(BaseImageRunner):
         for i in range(n_test):
             seed = test_start_seed + i
             enable_render = i < n_test_vis
-            enable_render = False
 
             def init_fn(env, seed=seed, enable_render=enable_render):
                 # setup rendering

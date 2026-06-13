@@ -388,7 +388,7 @@ class GMMFlowLowdimPolicy(BaseLowdimPolicy):
                 global_cond=global_cond,
             )
             trajectory = trajectory + dt * velocity
-            trajectory = trajectory.clamp(-1.2, 1.2)
+            trajectory = trajectory.clamp(-1.5, 1.5)
             
         return trajectory
 
