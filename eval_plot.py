@@ -6,14 +6,21 @@ This is a drop-in replacement for the original eval.py CLI, with extra outputs:
   - reward_curves.npz: raw padded per-step rewards
   - reward_curve.png: mean step-score curve
 
+Important split behavior:
+  - --split test:  run only test rollouts and draw one curve.
+  - --split train: run only train rollouts and draw one curve.
+  - --split all:   run train and test separately, then draw two different
+                   curves on the same figure.
+
 Typical usage:
-  python eval.py \
+  python eval_plot_train_test.py \
     --checkpoint data/outputs/.../checkpoints/latest.ckpt \
-    --device cuda:0
+    --device cuda:0 \
+    --split all
 
 By default, output_dir is derived from the checkpoint filename without its
-parent folders, e.g. /path/to/epoch_1750.ckpt -> ./epoch_1750. You can still
-override it with --output_dir.
+parent folders, e.g. /path/to/epoch_1750.ckpt -> data/eval/epoch_1750.
+You can still override it with --output_dir.
 """
 
 import sys
@@ -83,7 +90,7 @@ def default_output_dir_from_checkpoint(checkpoint: str) -> str:
     stem = pathlib.Path(name).stem
     directory = stem if stem else name
     directory = pathlib.Path("data") / "eval" / directory
-    return directory
+    return str(directory)
 
 
 def apply_eval_overrides(
@@ -94,7 +101,12 @@ def apply_eval_overrides(
     n_envs: Optional[int],
     n_vis: Optional[int],
 ) -> None:
-    """Mutate cfg.task.env_runner before hydra instantiation."""
+    """Mutate cfg.task.env_runner before hydra instantiation.
+
+    For split=all, train and test are both kept. If --num-rollouts is set, it
+    means that many train rollouts AND that many test rollouts, not a shared
+    total budget that is split between them.
+    """
     OmegaConf.set_struct(cfg, False)
     runner_cfg = cfg.task.env_runner
 
@@ -102,38 +114,32 @@ def apply_eval_overrides(
         runner_cfg.max_steps = int(max_steps)
     if n_envs is not None:
         runner_cfg.n_envs = int(n_envs)
-    if n_vis is not None:
-        if split == "train":
-            runner_cfg.n_train_vis = int(n_vis)
-        elif split == "test":
-            runner_cfg.n_test_vis = int(n_vis)
-        else:
-            # For split=all, keep train/test both visible but cap each side.
-            runner_cfg.n_train_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_train", 0)))
-            runner_cfg.n_test_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_test", 0)))
 
-    # Avoid wasting envs on the unused split.
     if split == "test":
         runner_cfg.n_train = 0
         runner_cfg.n_train_vis = 0
         if num_rollouts is not None:
             runner_cfg.n_test = int(num_rollouts)
+        if n_vis is not None:
+            runner_cfg.n_test_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_test", 0)))
+
     elif split == "train":
         runner_cfg.n_test = 0
         runner_cfg.n_test_vis = 0
         if num_rollouts is not None:
             runner_cfg.n_train = int(num_rollouts)
+        if n_vis is not None:
+            runner_cfg.n_train_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_train", 0)))
+
     elif split == "all":
         if num_rollouts is not None:
-            # Keep behavior simple and deterministic: first cap train, then test.
-            n_train = int(omega_get(runner_cfg, "n_train", 0))
-            n_test = int(omega_get(runner_cfg, "n_test", 0))
-            keep_train = min(n_train, int(num_rollouts))
-            keep_test = max(0, min(n_test, int(num_rollouts) - keep_train))
-            runner_cfg.n_train = keep_train
-            runner_cfg.n_test = keep_test
-            runner_cfg.n_train_vis = min(int(omega_get(runner_cfg, "n_train_vis", 0)), keep_train)
-            runner_cfg.n_test_vis = min(int(omega_get(runner_cfg, "n_test_vis", 0)), keep_test)
+            runner_cfg.n_train = int(num_rollouts)
+            runner_cfg.n_test = int(num_rollouts)
+        if n_vis is not None:
+            # Treat n_vis as per-split for split=all.
+            runner_cfg.n_train_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_train", 0)))
+            runner_cfg.n_test_vis = min(int(n_vis), int(omega_get(runner_cfg, "n_test", 0)))
+
     else:
         raise ValueError(f"Unsupported split: {split}")
 
@@ -181,8 +187,8 @@ def pad_rewards(rewards: Sequence[float], max_steps: int) -> np.ndarray:
 
 
 def select_indices(prefixes: Sequence[str], split: str) -> List[int]:
-    if split == "all":
-        return list(range(len(prefixes)))
+    if split not in {"train", "test"}:
+        raise ValueError("run_step_curve_eval expects split='train' or split='test'. Use main(split='all') to run both separately.")
     wanted = split + "/"
     return [i for i, prefix in enumerate(prefixes) if prefix == wanted]
 
@@ -252,6 +258,7 @@ def run_step_curve_eval(
             # action.shape[1] is the attempted chunk length. MultiStepWrapper stops
             # internally if the episode terminates or hits max_episode_steps.
             step_inc = int(action.shape[1]) if action.ndim >= 3 else 1
+            step_inc = min(step_inc, max_steps - approx_steps)
             approx_steps = min(max_steps, approx_steps + step_inc)
             pbar.update(step_inc)
         pbar.close()
@@ -296,16 +303,17 @@ def plot_curve(eval_data: Dict[str, Any], output_path: str, title: Optional[str]
     mean = eval_data["mean_curve"]
     std = eval_data["std_curve"]
     x = np.arange(mean.shape[0])
+    split = eval_data["split"]
 
     plt.figure(figsize=(11, 7))
-    plt.plot(x, mean, label="mean score", linewidth=2.2)
-    plt.fill_between(x, np.clip(mean - std, 0, 1), np.clip(mean + std, 0, 1), alpha=0.15, label="±1 std")
+    plt.plot(x, mean, label=f"{split} mean score", linewidth=2.2)
+    plt.fill_between(x, np.clip(mean - std, 0, 1), np.clip(mean + std, 0, 1), alpha=0.15, label=f"{split} ±1 std")
 
     if show_best_so_far:
-        plt.plot(x, eval_data["best_so_far_mean_curve"], label="mean best-so-far score", linestyle="--", linewidth=1.8)
+        plt.plot(x, eval_data["best_so_far_mean_curve"], label=f"{split} mean best-so-far score", linestyle="--", linewidth=1.8)
 
     if title is None:
-        title = f"Push-T Score-Step Curve ({rewards.shape[0]} rollouts)"
+        title = f"Push-T Score-Step Curve ({split}, {rewards.shape[0]} rollouts)"
     plt.title(title)
     plt.xlabel("Environment step")
     plt.ylabel("Score / target coverage")
@@ -318,26 +326,57 @@ def plot_curve(eval_data: Dict[str, Any], output_path: str, title: Optional[str]
     plt.close()
 
 
-def save_outputs(eval_data: Dict[str, Any], output_dir: str, show_best_so_far: bool) -> Dict[str, Any]:
-    output_dir = pathlib.Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def plot_comparison_curves(
+    eval_datas: Sequence[Dict[str, Any]],
+    output_path: str,
+    title: Optional[str] = None,
+    show_best_so_far: bool = True,
+) -> None:
+    plt.figure(figsize=(11, 7))
 
-    npz_path = output_dir / "reward_curves.npz"
-    np.savez_compressed(
-        npz_path,
-        rewards=eval_data["rewards"],
-        mean_curve=eval_data["mean_curve"],
-        std_curve=eval_data["std_curve"],
-        best_so_far_mean_curve=eval_data["best_so_far_mean_curve"],
-        episode_max=eval_data["episode_max"],
-        final_score=eval_data["final_score"],
-        seeds=np.asarray(eval_data["seeds"], dtype=np.int64),
-        raw_lengths=np.asarray(eval_data["raw_lengths"], dtype=np.int64),
-    )
+    max_len = 0
+    for eval_data in eval_datas:
+        mean = eval_data["mean_curve"]
+        std = eval_data["std_curve"]
+        x = np.arange(mean.shape[0])
+        split = eval_data["split"]
+        max_len = max(max_len, mean.shape[0])
 
-    plot_path = output_dir / "reward_curve.png"
-    plot_curve(eval_data, str(plot_path), show_best_so_far=show_best_so_far)
+        plt.plot(x, mean, label=f"{split} mean score", linewidth=2.2)
+        plt.fill_between(
+            x,
+            np.clip(mean - std, 0, 1),
+            np.clip(mean + std, 0, 1),
+            alpha=0.12,
+            label=f"{split} ±1 std",
+        )
 
+        if show_best_so_far:
+            plt.plot(
+                x,
+                eval_data["best_so_far_mean_curve"],
+                label=f"{split} mean best-so-far score",
+                linestyle="--",
+                linewidth=1.5,
+            )
+
+    if title is None:
+        parts = [f"{x['split']}={x['rewards'].shape[0]}" for x in eval_datas]
+        title = "Push-T Train/Test Score-Step Curves (" + ", ".join(parts) + " rollouts)"
+
+    plt.title(title)
+    plt.xlabel("Environment step")
+    plt.ylabel("Score / target coverage")
+    plt.xlim(0, max_len - 1)
+    plt.ylim(0, 1.05)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend(loc="lower right")
+    pathlib.Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def build_log_data(eval_data: Dict[str, Any], plot_path: pathlib.Path, npz_path: pathlib.Path) -> Dict[str, Any]:
     log_data: Dict[str, Any] = dict(eval_data["metrics"])
     log_data.update({
         "split": eval_data["split"],
@@ -362,6 +401,91 @@ def save_outputs(eval_data: Dict[str, Any], output_dir: str, show_best_so_far: b
         if video_path is not None:
             log_data[f"{key_base}/video_path"] = str(video_path)
 
+    return log_data
+
+
+def save_outputs(eval_data: Dict[str, Any], output_dir: str, show_best_so_far: bool) -> Dict[str, Any]:
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    npz_path = output_dir / "reward_curves.npz"
+    np.savez_compressed(
+        npz_path,
+        rewards=eval_data["rewards"],
+        mean_curve=eval_data["mean_curve"],
+        std_curve=eval_data["std_curve"],
+        best_so_far_mean_curve=eval_data["best_so_far_mean_curve"],
+        episode_max=eval_data["episode_max"],
+        final_score=eval_data["final_score"],
+        seeds=np.asarray(eval_data["seeds"], dtype=np.int64),
+        raw_lengths=np.asarray(eval_data["raw_lengths"], dtype=np.int64),
+    )
+
+    plot_path = output_dir / "reward_curve.png"
+    plot_curve(eval_data, str(plot_path), show_best_so_far=show_best_so_far)
+
+    log_data = build_log_data(eval_data, plot_path=plot_path, npz_path=npz_path)
+
+    json_path = output_dir / "eval_log.json"
+    with open(json_path, "w") as f:
+        json.dump(log_data, f, indent=2, sort_keys=True)
+
+    return log_data
+
+
+def save_comparison_outputs(
+    eval_datas: Sequence[Dict[str, Any]],
+    output_dir: str,
+    show_best_so_far: bool,
+) -> Dict[str, Any]:
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    arrays: Dict[str, Any] = {}
+    for eval_data in eval_datas:
+        split = eval_data["split"]
+        arrays[f"{split}_rewards"] = eval_data["rewards"]
+        arrays[f"{split}_mean_curve"] = eval_data["mean_curve"]
+        arrays[f"{split}_std_curve"] = eval_data["std_curve"]
+        arrays[f"{split}_best_so_far_mean_curve"] = eval_data["best_so_far_mean_curve"]
+        arrays[f"{split}_episode_max"] = eval_data["episode_max"]
+        arrays[f"{split}_final_score"] = eval_data["final_score"]
+        arrays[f"{split}_seeds"] = np.asarray(eval_data["seeds"], dtype=np.int64)
+        arrays[f"{split}_raw_lengths"] = np.asarray(eval_data["raw_lengths"], dtype=np.int64)
+
+    npz_path = output_dir / "reward_curves_train_test.npz"
+    np.savez_compressed(npz_path, **arrays)
+
+    plot_path = output_dir / "reward_curve_train_test.png"
+    plot_comparison_curves(eval_datas, str(plot_path), show_best_so_far=show_best_so_far)
+
+    log_data: Dict[str, Any] = {
+        "split": "all",
+        "reward_curve_png": str(plot_path),
+        "reward_curves_npz": str(npz_path),
+    }
+
+    for eval_data in eval_datas:
+        split = eval_data["split"]
+        log_data.update(eval_data["metrics"])
+        log_data[f"{split}/num_rollouts"] = int(eval_data["rewards"].shape[0])
+        log_data[f"{split}/max_steps"] = int(eval_data["rewards"].shape[1])
+
+        for seed, prefix, max_reward, final_reward, length, video_path in zip(
+            eval_data["seeds"],
+            eval_data["prefixes"],
+            eval_data["episode_max"],
+            eval_data["final_score"],
+            eval_data["raw_lengths"],
+            eval_data["video_paths"],
+        ):
+            key_base = f"{prefix}sim_{seed}"
+            log_data[f"{key_base}/max_reward"] = float(max_reward)
+            log_data[f"{key_base}/final_reward"] = float(final_reward)
+            log_data[f"{key_base}/length"] = int(length)
+            if video_path is not None:
+                log_data[f"{key_base}/video_path"] = str(video_path)
+
     json_path = output_dir / "eval_log.json"
     with open(json_path, "w") as f:
         json.dump(log_data, f, indent=2, sort_keys=True)
@@ -373,11 +497,11 @@ def save_outputs(eval_data: Dict[str, Any], output_dir: str, show_best_so_far: b
 @click.option("-c", "--checkpoint", required=True, type=str, help="Path to .ckpt checkpoint.")
 @click.option("-o", "--output_dir", default=None, type=str, help="Directory for eval outputs. Defaults to checkpoint filename without parent folders.")
 @click.option("-d", "--device", default="cuda:0", show_default=True, type=str)
-@click.option("--split", default="test", show_default=True, type=click.Choice(["test", "train", "all"]), help="Which rollout split to run/plot.")
-@click.option("--num-rollouts", default=None, type=int, help="Override number of rollouts for selected split.")
+@click.option("--split", default="all", show_default=True, type=click.Choice(["test", "train", "all"]), help="Which rollout split to run/plot. split=all runs train and test separately and plots both curves together.")
+@click.option("--num-rollouts", default=None, type=int, help="Override rollouts. For split=all, this is per split, not train+test total.")
 @click.option("--max-steps", default=1000, show_default=True, type=int, help="Override env_runner.max_steps.")
 @click.option("--n-envs", default=None, type=int, help="Override number of vectorized envs.")
-@click.option("--n-vis", default=None, type=int, help="Override number of recorded videos for selected split.")
+@click.option("--n-vis", default=None, type=int, help="Override number of recorded videos. For split=all, this is per split.")
 @click.option("--show-best-so-far/--hide-best-so-far", default=True, show_default=True, help="Overlay cumulative best-so-far score curve.")
 def main(
     checkpoint: str,
@@ -403,7 +527,6 @@ def main(
     payload = torch_load_checkpoint(checkpoint, device=torch.device("cpu"))
     cfg = payload["cfg"]
 
-
     apply_eval_overrides(
         cfg=cfg,
         split=split,
@@ -427,8 +550,16 @@ def main(
     policy.eval()
 
     runner = instantiate_env_runner(cfg, output_dir=output_dir)
-    eval_data = run_step_curve_eval(runner, policy, split=split)
-    log_data = save_outputs(eval_data, output_dir, show_best_so_far=show_best_so_far)
+
+    if split == "all":
+        eval_datas = [
+            run_step_curve_eval(runner, policy, split="train"),
+            run_step_curve_eval(runner, policy, split="test"),
+        ]
+        log_data = save_comparison_outputs(eval_datas, output_dir, show_best_so_far=show_best_so_far)
+    else:
+        eval_data = run_step_curve_eval(runner, policy, split=split)
+        log_data = save_outputs(eval_data, output_dir, show_best_so_far=show_best_so_far)
 
     print("\n=== Step-curve evaluation summary ===")
     for key, value in sorted(log_data.items()):
@@ -437,8 +568,12 @@ def main(
         ):
             print(f"{key}: {value:.6f}")
     print(f"Saved JSON: {pathlib.Path(output_dir) / 'eval_log.json'}")
-    print(f"Saved curves: {pathlib.Path(output_dir) / 'reward_curves.npz'}")
-    print(f"Saved plot: {pathlib.Path(output_dir) / 'reward_curve.png'}")
+    if split == "all":
+        print(f"Saved curves: {pathlib.Path(output_dir) / 'reward_curves_train_test.npz'}")
+        print(f"Saved plot: {pathlib.Path(output_dir) / 'reward_curve_train_test.png'}")
+    else:
+        print(f"Saved curves: {pathlib.Path(output_dir) / 'reward_curves.npz'}")
+        print(f"Saved plot: {pathlib.Path(output_dir) / 'reward_curve.png'}")
 
 
 if __name__ == "__main__":

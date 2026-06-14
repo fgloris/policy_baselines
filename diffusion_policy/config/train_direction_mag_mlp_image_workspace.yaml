@@ -1,0 +1,160 @@
+defaults:
+  - task: pusht_image
+  - _self_
+
+name: train_direction_mag_mlp_image
+_target_: diffusion_policy.workspace.train_direction_mag_mlp_image_workspace.TrainDirectionMagMLPImageWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "image_mlp"
+
+# Keep these aligned with train_diffusion_unet_image_workspace.yaml by default.
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+pred_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+# The MLP predicts pred_action_steps targets, while the env may execute fewer.
+# This keeps data padding correct if you run, e.g., n_action_steps=1 pred_action_steps=8.
+task:
+  dataset:
+    pad_after: ${eval:'${pred_action_steps}-1'}
+
+policy:
+  _target_: diffusion_policy.policy.direction_mag_mlp_image_policy.DirectionMagMLPImagePolicy
+
+  shape_meta: ${shape_meta}
+
+  # Identical observation encoder settings to train_diffusion_unet_image_workspace.yaml.
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    rgb_model:
+      _target_: diffusion_policy.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: null
+    resize_shape: null
+    crop_shape: [76, 76]
+    random_crop: True
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  horizon: ${horizon}
+  # Rollout execution length. For exact image-DP alignment this is 8.
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  # Supervised prediction length. Override to 8 with n_action_steps=1 for predict-8-execute-1.
+  pred_action_steps: ${pred_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  obs_as_global_cond: ${obs_as_global_cond}
+
+  # MLP head on top of the image global condition.
+  num_dir_bins: 32
+  hidden_dim: 512
+  depth: 4
+  activation: relu
+  layer_norm: True
+  dropout: 0.15
+
+  # Loss = Gaussian soft CE + Gaussian-weighted per-bin magnitude/bias regression
+  #      + (1 - Gaussian weight) magnitude regularization + vector reconstruction.
+  # All losses are computed in normalized action coordinates.
+  dir_loss_weight: 1.0
+  mag_loss_weight: 1.0
+  bias_loss_weight: 0.3
+  traj_loss_weight: 0.1
+  mag_all_reg_weight: 5.0e-2
+  gaussian_sigma_bins: 0.8
+  bias_range_bins: 0.8
+
+  # Ignore direction/bias labels when normalized step length is too small.
+  dir_eps: 1.0e-2
+  mag_scale: 5.0e-2
+  mag_head_init_bias: -2.0
+  oa_step_convention: True
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 501
+  gradient_accumulate_every: 1
+  use_ema: True
+  # EMA is OK here because the image encoder uses GroupNorm, matching image DP config.
+  freeze_encoder: False
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 25
+  sample_every: 25
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
