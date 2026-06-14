@@ -11,7 +11,7 @@ keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
 exp_name: "mlp"
 
-horizon: 16
+horizon: 4
 n_obs_steps: 2
 n_action_steps: 1
 pred_action_steps: 4

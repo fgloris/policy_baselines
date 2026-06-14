@@ -7,21 +7,20 @@ _target_: diffusion_policy.workspace.train_direction_mag_mlp_image_workspace.Tra
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "image_mlp"
+exp_name: "image_cnn_temporal_mlp"
 
 # Keep these aligned with train_diffusion_unet_image_workspace.yaml by default.
-horizon: 16
-n_obs_steps: 2
-n_action_steps: 8
-pred_action_steps: 8
+horizon: 8
+n_obs_steps: 1
+n_action_steps: 1
+pred_action_steps: 4
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
-# The MLP predicts pred_action_steps targets, while the env may execute fewer.
-# This keeps data padding correct if you run, e.g., n_action_steps=1 pred_action_steps=8.
+# Keep dataset padding tied to the supervised prediction length.
 task:
   dataset:
     pad_after: ${eval:'${pred_action_steps}-1'}
@@ -31,30 +30,32 @@ policy:
 
   shape_meta: ${shape_meta}
 
-  # Identical observation encoder settings to train_diffusion_unet_image_workspace.yaml.
+  # Lightweight shared image encoder: the same 3-layer CNN is reused for every
+  # obs frame, then the per-step image feature is fused with agent_pos.
   obs_encoder:
-    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    _target_: diffusion_policy.policy.direction_mag_mlp_image_policy.SimpleCNNObsEncoder
     shape_meta: ${shape_meta}
-    rgb_model:
-      _target_: diffusion_policy.model.vision.model_getter.get_resnet
-      name: resnet18
-      weights: null
-    resize_shape: null
+    rgb_key: image
     crop_shape: [76, 76]
     random_crop: True
+    channels: [32, 64, 128]
+    kernel_size: 5
     use_group_norm: True
-    share_rgb_model: False
-    imagenet_norm: True
+    activation: relu
+    output_dim: 128
 
   horizon: ${horizon}
-  # Rollout execution length. For exact image-DP alignment this is 8.
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
-  # Supervised prediction length. Override to 8 with n_action_steps=1 for predict-8-execute-1.
   pred_action_steps: ${pred_action_steps}
   n_obs_steps: ${n_obs_steps}
   obs_as_global_cond: ${obs_as_global_cond}
 
-  # MLP head on top of the image global condition.
+  # Unet1D-style temporal Conv1d over obs horizon before the MLP trunk.
+  temporal_channels: [128, 256, 256]
+  temporal_kernel_size: 3
+  temporal_n_groups: 8
+
+  # MLP trunk after temporal fusion.
   num_dir_bins: 32
   hidden_dim: 512
   depth: 4
@@ -64,7 +65,6 @@ policy:
 
   # Loss = Gaussian soft CE + Gaussian-weighted per-bin magnitude/bias regression
   #      + (1 - Gaussian weight) magnitude regularization + vector reconstruction.
-  # All losses are computed in normalized action coordinates.
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
   bias_loss_weight: 0.3
@@ -73,7 +73,6 @@ policy:
   gaussian_sigma_bins: 0.8
   bias_range_bins: 0.8
 
-  # Ignore direction/bias labels when normalized step length is too small.
   dir_eps: 1.0e-2
   mag_scale: 5.0e-2
   mag_head_init_bias: -2.0
@@ -118,7 +117,6 @@ training:
   num_epochs: 501
   gradient_accumulate_every: 1
   use_ema: True
-  # EMA is OK here because the image encoder uses GroupNorm, matching image DP config.
   freeze_encoder: False
   rollout_every: 50
   checkpoint_every: 50
