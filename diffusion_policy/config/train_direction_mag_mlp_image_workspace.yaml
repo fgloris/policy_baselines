@@ -7,11 +7,10 @@ _target_: diffusion_policy.workspace.train_direction_mag_mlp_image_workspace.Tra
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "image_cnn_temporal_mlp"
+exp_name: "current_image_normal_kp_mlp"
 
-# Keep these aligned with train_diffusion_unet_image_workspace.yaml by default.
-horizon: 8
-n_obs_steps: 1
+horizon: ${eval:'${n_obs_steps}-1+${pred_action_steps}'}
+n_obs_steps: 4
 n_action_steps: 1
 pred_action_steps: 4
 n_latency_steps: 0
@@ -20,7 +19,6 @@ past_action_visible: False
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
-# Keep dataset padding tied to the supervised prediction length.
 task:
   dataset:
     pad_after: ${eval:'${pred_action_steps}-1'}
@@ -30,19 +28,17 @@ policy:
 
   shape_meta: ${shape_meta}
 
-  # Lightweight shared image encoder: the same 3-layer CNN is reused for every
-  # obs frame, then the per-step image feature is fused with agent_pos.
+  # Lightweight 3-layer CNN. No crop / random crop: feed the full image.
   obs_encoder:
     _target_: diffusion_policy.policy.direction_mag_mlp_image_policy.SimpleCNNObsEncoder
     shape_meta: ${shape_meta}
     rgb_key: image
-    crop_shape: [76, 76]
-    random_crop: True
     channels: [32, 64, 128]
     kernel_size: 5
     use_group_norm: True
-    activation: relu
-    output_dim: 128
+    activation: silu
+    output_dim: 512
+    spatial_flatten: True
 
   horizon: ${horizon}
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
@@ -50,21 +46,17 @@ policy:
   n_obs_steps: ${n_obs_steps}
   obs_as_global_cond: ${obs_as_global_cond}
 
-  # Unet1D-style temporal Conv1d over obs horizon before the MLP trunk.
-  temporal_channels: [128, 256, 256]
-  temporal_kernel_size: 3
-  temporal_n_groups: 8
+  # Use only the current image. For low-dim input, use normal normalized
+  # agent_pos history, including the current frame, same semantics as image DP.
+  keypoint_obs_steps: ${n_obs_steps}
 
-  # MLP trunk after temporal fusion.
   num_dir_bins: 32
-  hidden_dim: 512
-  depth: 4
+  hidden_dim: 1024
+  depth: 3
   activation: relu
   layer_norm: True
-  dropout: 0.15
+  dropout: 0.10
 
-  # Loss = Gaussian soft CE + Gaussian-weighted per-bin magnitude/bias regression
-  #      + (1 - Gaussian weight) magnitude regularization + vector reconstruction.
   dir_loss_weight: 1.0
   mag_loss_weight: 1.0
   bias_loss_weight: 0.3
@@ -102,7 +94,7 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 3.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -114,7 +106,7 @@ training:
   resume: False
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 501
+  num_epochs: 1001
   gradient_accumulate_every: 1
   use_ema: True
   freeze_encoder: False

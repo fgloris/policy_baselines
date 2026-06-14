@@ -6,31 +6,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
-from diffusion_policy.model.diffusion.conv1d_components import Conv1dBlock
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
 
 class SimpleCNNObsEncoder(nn.Module):
     """
-    Lightweight shared image encoder for Push-T image experiments.
+    Lightweight 3-layer CNN encoder for the current image observation.
 
-    The same CNN is reused for every observation frame in the obs horizon.
-    It processes a single image of shape [B, C, H, W] and returns a feature
-    vector [B, D]. This is intentionally much smaller than the ResNet encoder
-    used by DiffusionUnetImagePolicy.
+    Important: this encoder preserves spatial information by default. The
+    previous avg-pool version made the image feature almost translation
+    invariant, which is bad for Push-T because the action depends heavily on
+    object / end-effector positions in the image.
     """
 
     def __init__(
         self,
         shape_meta: dict,
         rgb_key: str = "image",
-        crop_shape=None,
-        random_crop: bool = True,
         channels: Sequence[int] = (32, 64, 128),
         kernel_size: int = 5,
         use_group_norm: bool = True,
-        activation: str = "relu",
-        output_dim: int = 128,
+        activation: str = "silu",
+        output_dim: int = 512,
+        spatial_flatten: bool = True,
     ):
         super().__init__()
         assert rgb_key in shape_meta["obs"], f"Missing rgb key: {rgb_key}"
@@ -42,11 +40,12 @@ class SimpleCNNObsEncoder(nn.Module):
         self.shape_meta = shape_meta
         self.rgb_key = rgb_key
         self.in_shape = in_shape
-        self.crop_shape = tuple(crop_shape) if crop_shape is not None else None
-        self.random_crop = random_crop
         self.output_dim = output_dim
+        self.spatial_flatten = spatial_flatten
 
-        if activation.lower() == "mish":
+        if activation.lower() == "silu":
+            act_cls = nn.SiLU
+        elif activation.lower() == "mish":
             act_cls = nn.Mish
         elif activation.lower() == "gelu":
             act_cls = nn.GELU
@@ -68,75 +67,61 @@ class SimpleCNNObsEncoder(nn.Module):
                 layers.append(nn.BatchNorm2d(dim_out))
             layers.append(act_cls())
             dim_in = dim_out
-
         self.conv = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.proj = nn.Linear(dim_in, output_dim) if output_dim is not None else nn.Identity()
-        self._feat_dim = output_dim if output_dim is not None else dim_in
 
-    def _apply_crop(self, x: torch.Tensor) -> torch.Tensor:
-        if self.crop_shape is None:
-            return x
-        crop_h, crop_w = self.crop_shape
-        _, _, h, w = x.shape
-        assert crop_h <= h and crop_w <= w, (
-            f"crop_shape {self.crop_shape} is larger than input image {(h, w)}"
-        )
-        if crop_h == h and crop_w == w:
-            return x
+        with torch.no_grad():
+            dummy = torch.zeros((1,) + self.in_shape, dtype=torch.float32)
+            conv_out = self.conv(dummy)
+            conv_flat_dim = int(math.prod(conv_out.shape[1:]))
 
-        if self.training and self.random_crop:
-            max_top = h - crop_h
-            max_left = w - crop_w
-            tops = torch.randint(0, max_top + 1, (x.shape[0],), device=x.device)
-            lefts = torch.randint(0, max_left + 1, (x.shape[0],), device=x.device)
-            out = torch.empty(
-                (x.shape[0], x.shape[1], crop_h, crop_w),
-                device=x.device,
-                dtype=x.dtype,
-            )
-            for i in range(x.shape[0]):
-                top = int(tops[i].item())
-                left = int(lefts[i].item())
-                out[i] = x[i, :, top:top + crop_h, left:left + crop_w]
-            return out
-
-        top = (h - crop_h) // 2
-        left = (w - crop_w) // 2
-        return x[:, :, top:top + crop_h, left:left + crop_w]
+        if spatial_flatten:
+            if output_dim is None:
+                self.head = nn.Flatten(start_dim=1)
+                self._feat_dim = conv_flat_dim
+            else:
+                self.head = nn.Sequential(
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(conv_flat_dim, output_dim),
+                    act_cls(),
+                )
+                self._feat_dim = output_dim
+        else:
+            if output_dim is None:
+                self.head = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(start_dim=1),
+                )
+                self._feat_dim = dim_in
+            else:
+                self.head = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(dim_in, output_dim),
+                    act_cls(),
+                )
+                self._feat_dim = output_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
-        x = self._apply_crop(x)
         x = self.conv(x)
-        x = self.pool(x)
-        x = x.flatten(start_dim=1)
-        x = self.proj(x)
+        x = self.head(x)
         return x
 
     @torch.no_grad()
     def output_shape(self):
-        dummy = torch.zeros((1,) + self.in_shape, dtype=torch.float32)
-        out = self.forward(dummy)
-        return out.shape[1:]
+        return (self._feat_dim,)
 
 
 class DirectionMagMLPImagePolicy(BaseImagePolicy):
     """
     Push-T image baseline:
-      image -> shared 3-layer CNN (per obs step)
-      + normalized low-dim obs / keypoints (per obs step)
-      -> Unet1D-style temporal Conv1d stack across obs horizon
-      -> MLP trunk
-      -> direction logits + magnitude + angular bias for each predicted action.
+      current image -> 3-layer CNN
+      normalized agent_pos history -> flatten
+      concat -> MLP trunk -> direction logits + magnitude + angular bias
 
-    This keeps the data path aligned with DiffusionUnetImagePolicy:
-      - same image dataset / normalizer / runner
-      - same n_obs_steps semantics
-      - same action chunk prediction semantics
-
-    The main difference is that the ResNet + diffusion U-Net is replaced with a
-    lightweight shared CNN encoder and a temporal Conv1d + MLP head.
+    Unlike the relative-history variant, this uses the normal Push-T image
+    observation convention: agent_pos is fed directly after the obs normalizer,
+    including the current frame.
     """
 
     def __init__(
@@ -147,13 +132,11 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         n_action_steps: int,
         n_obs_steps: int,
         pred_action_steps: int = None,
+        keypoint_history_steps: int = None,
         num_dir_bins: int = 32,
-        temporal_channels: Sequence[int] = (128, 256, 256),
-        temporal_kernel_size: int = 3,
-        temporal_n_groups: int = 8,
         hidden_dim: int = 512,
-        depth: int = 4,
-        activation: str = "relu",
+        depth: int = 3,
+        activation: str = "silu",
         layer_norm: bool = True,
         dropout: float = 0.0,
         dir_loss_weight: float = 1.0,
@@ -168,12 +151,18 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         mag_head_init_bias: float = -2.0,
         oa_step_convention: bool = True,
         obs_as_global_cond: bool = True,
-        # Deprecated; kept so older hydra overrides do not crash.
+        # Deprecated / ignored; kept so older hydra overrides do not crash.
+        image_obs_steps: int = 1,
+        keypoint_obs_steps: int = None,
+        temporal_channels=None,
+        temporal_kernel_size: int = None,
+        temporal_n_groups: int = None,
         dir_neighbor_smoothing: float = None,
         **kwargs,
     ):
         super().__init__()
         assert obs_as_global_cond, "This baseline only supports global observation conditioning."
+        assert image_obs_steps == 1, "This baseline intentionally uses only the current image."
 
         action_shape = shape_meta["action"]["shape"]
         assert len(action_shape) == 1
@@ -183,63 +172,50 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         assert n_action_steps >= 1
         if pred_action_steps is None:
             pred_action_steps = n_action_steps
+        if keypoint_obs_steps is None:
+            if keypoint_history_steps is not None:
+                # Backward compatibility for older configs. In the new normal-kpt
+                # setting this means "use this many normalized agent_pos frames",
+                # not "use relative history and omit the current frame".
+                keypoint_obs_steps = keypoint_history_steps
+            else:
+                keypoint_obs_steps = n_obs_steps
         assert pred_action_steps >= n_action_steps, "pred_action_steps should be >= n_action_steps."
+        assert 1 <= keypoint_obs_steps <= n_obs_steps
         assert depth >= 1
         assert hidden_dim > 0
         assert 0.0 <= dropout < 1.0
         assert mag_all_reg_weight >= 0.0
         assert gaussian_sigma_bins > 0.0
         assert bias_range_bins > 0.0
-        assert len(temporal_channels) >= 1
 
         obs_meta = shape_meta["obs"]
         rgb_obs_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "rgb"]
-        lowdim_obs_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "low_dim"]
         assert len(rgb_obs_keys) == 1, (
             f"Expected exactly one rgb obs key for this baseline, got {rgb_obs_keys}"
         )
-        assert "agent_pos" in lowdim_obs_keys, "Push-T image baseline needs obs['agent_pos']."
+        assert "agent_pos" in obs_meta, "Push-T image baseline needs obs['agent_pos']."
+        agent_pos_shape = tuple(obs_meta["agent_pos"]["shape"])
+        assert agent_pos_shape == (2,), f"Expected agent_pos shape (2,), got {agent_pos_shape}"
 
         self.shape_meta = shape_meta
         self.obs_encoder = obs_encoder
         self.rgb_obs_key = rgb_obs_keys[0]
-        self.lowdim_obs_keys = sorted(lowdim_obs_keys)
 
         image_feature_dim = obs_encoder.output_shape()[0]
-        lowdim_feature_dim = 0
-        for key in self.lowdim_obs_keys:
-            shape = tuple(obs_meta[key]["shape"])
-            lowdim_feature_dim += int(math.prod(shape))
-        step_feature_dim = image_feature_dim + lowdim_feature_dim
-
-        temporal_layers = []
-        dim_in = step_feature_dim
-        for dim_out in temporal_channels:
-            assert dim_out % temporal_n_groups == 0, (
-                f"Temporal channel {dim_out} must be divisible by temporal_n_groups={temporal_n_groups}"
-            )
-            temporal_layers.append(
-                Conv1dBlock(
-                    inp_channels=dim_in,
-                    out_channels=dim_out,
-                    kernel_size=temporal_kernel_size,
-                    n_groups=temporal_n_groups,
-                )
-            )
-            dim_in = dim_out
-        self.temporal_encoder = nn.Sequential(*temporal_layers)
-        temporal_out_dim = temporal_channels[-1] * n_obs_steps
+        keypoint_feature_dim = agent_pos_shape[0] * keypoint_obs_steps
+        obs_feature_dim = image_feature_dim + keypoint_feature_dim
 
         self.horizon = horizon
         self.action_dim = action_dim
         self.image_feature_dim = image_feature_dim
-        self.lowdim_feature_dim = lowdim_feature_dim
-        self.step_feature_dim = step_feature_dim
-        self.temporal_feature_dim = temporal_channels[-1]
-        self.obs_feature_dim = temporal_out_dim
+        self.keypoint_feature_dim = keypoint_feature_dim
+        self.obs_feature_dim = obs_feature_dim
         self.n_action_steps = n_action_steps
         self.pred_action_steps = pred_action_steps
         self.n_obs_steps = n_obs_steps
+        self.keypoint_obs_steps = keypoint_obs_steps
+        self.image_obs_steps = 1
         self.num_dir_bins = num_dir_bins
         self.hidden_dim = hidden_dim
         self.depth = depth
@@ -259,7 +235,9 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
 
         self.normalizer = LinearNormalizer()
 
-        if activation.lower() == "mish":
+        if activation.lower() == "silu":
+            act_cls = nn.SiLU
+        elif activation.lower() == "mish":
             act_cls = nn.Mish
         elif activation.lower() == "gelu":
             act_cls = nn.GELU
@@ -269,7 +247,7 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
             raise ValueError(f"Unsupported activation: {activation}")
 
         layers = []
-        dim = temporal_out_dim
+        dim = obs_feature_dim
         for _ in range(depth):
             layers.append(nn.Linear(dim, hidden_dim))
             if layer_norm:
@@ -323,39 +301,28 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         end = start + self.pred_action_steps
         return start, end
 
-    def _collect_lowdim_obs(self, nobs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        feats = []
-        for key in self.lowdim_obs_keys:
-            x = nobs[key][:, : self.n_obs_steps, ...]
-            feats.append(x.reshape(x.shape[0], x.shape[1], -1))
-        return torch.cat(feats, dim=-1)
-
-    def _encode_obs(self, nobs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Encode the first n_obs_steps observations.
-
-        Image frames are processed independently by the shared CNN, then the
-        per-step image feature is concatenated with the corresponding low-dim
-        obs feature, followed by a temporal Conv1d stack over the obs horizon.
-        """
-        image = nobs[self.rgb_obs_key][:, : self.n_obs_steps, ...]
-        B, To = image.shape[:2]
-        image = image.reshape(B * To, *image.shape[2:])
-        image_feat = self.obs_encoder(image).reshape(B, To, -1)
-
-        lowdim_feat = self._collect_lowdim_obs(nobs)
-        step_feat = torch.cat([image_feat, lowdim_feat], dim=-1)
-
-        temp = step_feat.transpose(1, 2)
-        temp = self.temporal_encoder(temp)
-        return temp.reshape(B, -1)
-
     def _current_agent_pos_action_normalized(self, raw_obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         raw_agent_pos = raw_obs["agent_pos"][:, self.n_obs_steps - 1, :]
         return self.normalizer["action"].normalize(raw_agent_pos)
 
-    def _forward_heads(self, nobs: Dict[str, torch.Tensor]):
-        h = self.trunk(self._encode_obs(nobs))
+    def _collect_keypoint_obs(self, nobs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Flatten normal normalized agent_pos observations, including current frame."""
+        start = self.n_obs_steps - self.keypoint_obs_steps
+        agent_pos = nobs["agent_pos"][:, start:self.n_obs_steps, :]
+        return agent_pos.reshape(agent_pos.shape[0], -1)
+
+    def _encode_obs(self, raw_obs: Dict[str, torch.Tensor], nobs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Use only the current/latest image, plus normal normalized agent_pos
+        history. The current agent_pos is included.
+        """
+        image = nobs[self.rgb_obs_key][:, self.n_obs_steps - 1, ...]
+        image_feat = self.obs_encoder(image)
+        keypoint_feat = self._collect_keypoint_obs(nobs)
+        return torch.cat([image_feat, keypoint_feat], dim=-1)
+
+    def _forward_heads(self, raw_obs: Dict[str, torch.Tensor], nobs: Dict[str, torch.Tensor]):
+        h = self.trunk(self._encode_obs(raw_obs, nobs))
         B = h.shape[0]
         dir_logits = self.dir_head(h).reshape(B, self.pred_action_steps, self.num_dir_bins)
 
@@ -406,7 +373,7 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         raw_obs = obs_dict
         nobs = self.normalizer.normalize(obs_dict)
 
-        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(nobs)
+        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(raw_obs, nobs)
         dir_idx = torch.argmax(dir_logits, dim=-1)
         pred_log_mag = self._gather_by_dir(pred_log_mag_all, dir_idx)
         pred_mag = self._gather_by_dir(pred_mag_all, dir_idx)
@@ -448,6 +415,13 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
 
         start, end = self._action_start_end()
         naction_target = naction[:, start:end, :]
+        if naction_target.shape[1] != self.pred_action_steps:
+            raise RuntimeError(
+                f"Not enough action targets: got {naction_target.shape[1]} steps, "
+                f"expected pred_action_steps={self.pred_action_steps}. "
+                f"Set horizon >= n_obs_steps - 1 + pred_action_steps "
+                f"({self.n_obs_steps - 1 + self.pred_action_steps})."
+            )
         n_agent_pos = self._current_agent_pos_action_normalized(raw_obs)
 
         ndelta_gt = self._target_delta(naction_target, n_agent_pos)
@@ -456,7 +430,7 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         valid_dir = mag_target > self.dir_eps
         valid_float = valid_dir.float()
 
-        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(nobs)
+        dir_logits, pred_log_mag_all, pred_mag_all, pred_bias_norm_all, pred_bias_angle_all = self._forward_heads(raw_obs, nobs)
 
         # 1) Direction classification loss: circular Gaussian soft CE.
         gauss_w, angle_delta = self._gaussian_dir_weights(theta_target)
@@ -481,7 +455,7 @@ class DirectionMagMLPImagePolicy(BaseImagePolicy):
         bias_w = reg_w * bias_expr_mask
         bias_loss_all_bins = F.smooth_l1_loss(
             pred_bias_norm_all,
-            bias_target_norm.clamp(min=-1.0, max=1.0),
+            bias_target_norm.clamp(min=-1.0, max=1.0).expand_as(pred_bias_norm_all),
             reduction="none",
         )
         bias_loss = (bias_w * bias_loss_all_bins).sum() / bias_w.sum().clamp_min(1.0)
