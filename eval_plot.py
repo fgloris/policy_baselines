@@ -12,6 +12,12 @@ Important split behavior:
   - --split all:   run train and test separately, then draw two different
                    curves on the same figure.
 
+Compatibility:
+  - Supports current lowdim/keypoints checkpoints.
+  - Supports current image checkpoints.
+  - Also remaps older official image/hybrid checkpoint target names to the
+    current image workspace/policy names when possible.
+
 Typical usage:
   python eval_plot_train_test.py \
     --checkpoint data/outputs/.../checkpoints/latest.ckpt \
@@ -32,7 +38,9 @@ import json
 import math
 import os
 import pathlib
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import importlib
+import types
 
 import click
 import dill
@@ -40,7 +48,7 @@ import hydra
 import numpy as np
 import torch
 import tqdm
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig, ListConfig
 
 # Use a non-interactive backend so the script works on servers without DISPLAY.
 import matplotlib
@@ -82,6 +90,124 @@ def omega_get(container: Any, key: str, default: Any = None) -> Any:
         return getattr(container, key)
     except Exception:
         return default
+
+
+LEGACY_TARGET_ALIASES: Dict[str, str] = {
+    # Official / older Diffusion Policy image checkpoints used "hybrid"
+    # naming. This cleaned repo uses "image" naming for the same Push-T image
+    # policy/workspace family.
+    "diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace":
+        "diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace",
+    "diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy":
+        "diffusion_policy.policy.diffusion_unet_image_policy.DiffusionUnetImagePolicy",
+}
+
+LEGACY_MODULE_ALIASES: Sequence[Tuple[str, str, str, str]] = (
+    (
+        "diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace",
+        "TrainDiffusionUnetHybridWorkspace",
+        "diffusion_policy.workspace.train_diffusion_unet_image_workspace",
+        "TrainDiffusionUnetImageWorkspace",
+    ),
+    (
+        "diffusion_policy.policy.diffusion_unet_hybrid_image_policy",
+        "DiffusionUnetHybridImagePolicy",
+        "diffusion_policy.policy.diffusion_unet_image_policy",
+        "DiffusionUnetImagePolicy",
+    ),
+)
+
+
+def install_legacy_import_aliases() -> None:
+    """Install import aliases for old checkpoint target names.
+
+    Some official image checkpoints store target strings such as
+    diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.
+    This repo has the equivalent implementation under image names. Patching the
+    cfg usually handles this, but module aliases make Hydra/dill fallback-safe.
+    """
+    for old_module, old_class, new_module, new_class in LEGACY_MODULE_ALIASES:
+        if old_module in sys.modules:
+            continue
+        try:
+            new_mod = importlib.import_module(new_module)
+            new_cls = getattr(new_mod, new_class)
+        except Exception:
+            continue
+        alias_mod = types.ModuleType(old_module)
+        setattr(alias_mod, old_class, new_cls)
+        sys.modules[old_module] = alias_mod
+        try:
+            parent_name, leaf_name = old_module.rsplit(".", 1)
+            parent_mod = importlib.import_module(parent_name)
+            setattr(parent_mod, leaf_name, alias_mod)
+        except Exception:
+            pass
+
+
+def _patch_legacy_targets_in_node(node: Any, path: str, patches: List[Tuple[str, str, str]]) -> None:
+    if isinstance(node, DictConfig):
+        for key in list(node.keys()):
+            try:
+                value = node[key]
+            except Exception:
+                continue
+            child_path = f"{path}.{key}"
+            if isinstance(value, str):
+                new_value = LEGACY_TARGET_ALIASES.get(value)
+                if new_value is not None:
+                    node[key] = new_value
+                    patches.append((child_path, value, new_value))
+            else:
+                _patch_legacy_targets_in_node(value, child_path, patches)
+    elif isinstance(node, ListConfig):
+        for idx in range(len(node)):
+            try:
+                value = node[idx]
+            except Exception:
+                continue
+            child_path = f"{path}[{idx}]"
+            if isinstance(value, str):
+                new_value = LEGACY_TARGET_ALIASES.get(value)
+                if new_value is not None:
+                    node[idx] = new_value
+                    patches.append((child_path, value, new_value))
+            else:
+                _patch_legacy_targets_in_node(value, child_path, patches)
+
+
+def patch_legacy_targets(cfg: OmegaConf) -> List[Tuple[str, str, str]]:
+    """Rewrite known old target strings in-place and return applied patches."""
+    OmegaConf.set_struct(cfg, False)
+    patches: List[Tuple[str, str, str]] = []
+    _patch_legacy_targets_in_node(cfg, "cfg", patches)
+    return patches
+
+
+def get_workspace_class_from_cfg(cfg: OmegaConf):
+    """Resolve workspace class, with a final image/lowdim fallback."""
+    try:
+        return hydra.utils.get_class(cfg._target_)
+    except Exception as first_error:
+        # Last-resort fallback. This helps if a checkpoint has an unknown old
+        # workspace target but the policy/env_runner clearly identifies which
+        # implementation family it needs.
+        policy_target = str(omega_get(omega_get(cfg, "policy", None), "_target_", ""))
+        runner_target = str(omega_get(omega_get(omega_get(cfg, "task", None), "env_runner", None), "_target_", ""))
+        combined = (str(omega_get(cfg, "_target_", "")) + " " + policy_target + " " + runner_target).lower()
+
+        if "direction_mag_mlp" in combined:
+            fallback = "diffusion_policy.workspace.train_direction_mag_mlp_lowdim_workspace.TrainDirectionMagMLPLowdimWorkspace"
+        elif "image" in combined or "hybrid" in combined:
+            fallback = "diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace"
+        elif "lowdim" in combined or "keypoint" in combined or "flow" in combined or "xpred" in combined or "gmm" in combined:
+            fallback = "diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace"
+        else:
+            raise first_error
+
+        print(f"[compat] Failed to import workspace target {cfg._target_!r}; falling back to {fallback!r}.")
+        cfg._target_ = fallback
+        return hydra.utils.get_class(fallback)
 
 
 def default_output_dir_from_checkpoint(checkpoint: str) -> str:
@@ -524,8 +650,13 @@ def main(
 
     device_obj = torch.device(device)
 
+    install_legacy_import_aliases()
+
     payload = torch_load_checkpoint(checkpoint, device=torch.device("cpu"))
     cfg = payload["cfg"]
+    patches = patch_legacy_targets(cfg)
+    for path, old, new in patches:
+        print(f"[compat] patched {path}: {old} -> {new}")
 
     apply_eval_overrides(
         cfg=cfg,
@@ -536,8 +667,9 @@ def main(
         n_vis=n_vis,
     )
 
-    # Instantiate workspace/model exactly like the original eval.py.
-    cls = hydra.utils.get_class(cfg._target_)
+    # Instantiate workspace/model exactly like the original eval.py, while
+    # tolerating old official image/hybrid target names.
+    cls = get_workspace_class_from_cfg(cfg)
     workspace = cls(cfg, output_dir=output_dir)
     workspace: BaseWorkspace
     workspace.load_payload(payload, exclude_keys=None, include_keys=None)
